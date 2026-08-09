@@ -1,5 +1,6 @@
 
 import time
+import argparse
 import ccxt
 from apscheduler.schedulers.blocking import BlockingScheduler
 from datetime import datetime
@@ -35,6 +36,27 @@ LEVERAGE = 50
 last_order_time = 0
 # 全局：账户持仓模式缓存（net_mode / long_short_mode）
 pos_mode_cache = None
+# 全局：下单数量（单位：ETH），由命令行 -amount 传入，默认 10 ETH
+AMOUNT_ETH = 10.0
+
+
+def parse_args():
+    """解析命令行参数：-amount 指定下单 ETH 数量"""
+    parser = argparse.ArgumentParser(description='OKX 模拟盘 ETH 永续策略')
+    # 注意：argparse 中 -amount 这种单杠多字符选项需显式注册
+    parser.add_argument('-amount', '--amount', dest='amount',
+                        type=float, default=10.0,
+                        help='下单数量(ETH)，默认 10 ETH。例: -amount 10 表示下单 10 ETH')
+    return parser.parse_args()
+
+
+def eth_to_contracts(eth_amount):
+    """将 ETH 数量转换为 OKX 合约张数。
+    OKX ETH/USDT:USDT 永续 1 张 = 0.1 ETH，故 10 ETH = 100 张。
+    """
+    market = exchange.market(SYMBOL)
+    contract_size = float(market.get('contractSize', 1)) or 1.0
+    return eth_amount / contract_size
 
 
 def detect_pos_mode():
@@ -203,9 +225,10 @@ def execute_strategy():
         ticker = exchange.fetch_ticker(SYMBOL)
         current_price = ticker['last']
         short_price = round(current_price - 0.01, 2)
-        short_amount = 10
+        # 按 ETH 数量换算为合约张数（OKX ETH 永续 1 张 = 0.1 ETH）
+        short_amount = eth_to_contracts(AMOUNT_ETH)
 
-        print(f"[初始空单] 当前市价: {current_price} -> 计划以 {short_price} 挂限价做空 {short_amount} ETH")
+        print(f"[初始空单] 当前市价: {current_price} -> 计划以 {short_price} 挂限价做空 {AMOUNT_ETH} ETH (={short_amount} 张合约)")
 
         # 5. 挂出初始限价空单并附加限价止盈止损
         short_sl_trigger = round(short_price + 2, 2)
@@ -249,7 +272,8 @@ def execute_strategy():
 
                 # 8. 反向翻仓：下限价看涨做多
                 long_price = round(short_sl_trigger + 0.01, 2)
-                long_amount = 11
+                # 翻仓数量 = 初始空单张数 × 2
+                long_amount = short_amount * 2
 
                 long_tp_trigger = round(long_price + 2, 2)
                 long_sl_trigger = round(long_price - 2, 2)
@@ -261,7 +285,7 @@ def execute_strategy():
                     tp_trigger=long_tp_trigger,
                 )
 
-                print(f"[反向翻仓] 正在挂出限价做多单，价格: {long_price}, 数量: {long_amount} ETH")
+                print(f"[反向翻仓] 正在挂出限价做多单，价格: {long_price}, 数量: {long_amount} 张合约")
                 try:
                     long_order = exchange.create_order(
                         symbol=SYMBOL, type='limit', side='buy',
@@ -291,6 +315,11 @@ def execute_strategy():
 
 # ================= 定时任务配置 =================
 if __name__ == "__main__":
+    # 解析命令行参数：-amount 指定下单 ETH 数量
+    args = parse_args()
+    AMOUNT_ETH = float(args.amount)
+    print(f"启动配置：下单数量 = {AMOUNT_ETH} ETH")
+
     # 启动时先执行一次配置检查
     set_leverage_safely()
 
