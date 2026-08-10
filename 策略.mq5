@@ -1,6 +1,6 @@
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "2.4.1"
+#property version   "2.4.3"
 
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh>
@@ -67,6 +67,42 @@ void OnDeinit(const int reason)
    EventKillTimer();
 }
 
+
+//+------------------------------------------------------------------+
+//| 辅助函数：提取商品的基础名称（自动剥离 .n, m, pro 等各种后缀）       |
+//| 例如："XAUUSD.n" -> "XAUUSD" | "EURUSDm" -> "EURUSD"            |
+//+------------------------------------------------------------------+
+string GetBaseSymbol(string fullSymbol)
+{
+   // 转为大写，避免大小写不一致问题
+   StringToUpper(fullSymbol);
+   
+   // 常见的外汇/贵金属基础品种长度通常是 6 位（如 XAUUSD, EURUSD）
+   // 如果包含点号 '.'，直接取点号前面的部分
+   int dotPos = StringFind(fullSymbol, ".");
+   if(dotPos > 0)
+   {
+      return StringSubstr(fullSymbol, 0, dotPos);
+   }
+   
+   // 如果不带点号，但长度大于 6（例如 XAUUSDm），尝试截取前 6 位
+   if(StringLen(fullSymbol) > 6)
+   {
+      // 针对 XAUUSD / BTCUSD 等标准 6 位标的提取
+      return StringSubstr(fullSymbol, 0, 6);
+   }
+   
+   return fullSymbol;
+}
+
+//+------------------------------------------------------------------+
+//| 判断两个品种是否属于同一个基础商品                               |
+//+------------------------------------------------------------------+
+bool IsSameBaseSymbol(string symbolA, string symbolB)
+{
+   return (GetBaseSymbol(symbolA) == GetBaseSymbol(symbolB));
+}
+
 //+------------------------------------------------------------------+
 //| 辅助函数：获取当前魔术码最新的持仓 ID                           |
 //+------------------------------------------------------------------+
@@ -120,35 +156,76 @@ datetime CalculateNextTriggerTime(datetime fromTime)
 }
 
 //+------------------------------------------------------------------+
-//| 检查挂单与持仓状态工具函数... (保持不变，省略展开以聚焦核心逻辑)     |
+//| 修复版：检查是否存在同方向挂单（兼容任意后缀）                     |
 //+------------------------------------------------------------------+
 bool CheckHasSameDirectionPending(ENUM_POSITION_TYPE checkType)
 {
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
-      const ulong ticket = OrderGetTicket(i);
-      if(ticket == 0) continue;
-      if(OrderSelect(ticket) && OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+      ulong orderTicket = OrderGetTicket(i);
+      if(orderTicket == 0) continue;
+      
+      if(OrderSelect(orderTicket))
       {
-         long ordType = OrderGetInteger(ORDER_TYPE);
-         if(checkType == POSITION_TYPE_BUY && (ordType == ORDER_TYPE_BUY_LIMIT || ordType == ORDER_TYPE_BUY_STOP || ordType == ORDER_TYPE_BUY_STOP_LIMIT))
-            return true;
-         else if(checkType == POSITION_TYPE_SELL && (ordType == ORDER_TYPE_SELL_LIMIT || ordType == ORDER_TYPE_SELL_STOP || ordType == ORDER_TYPE_SELL_STOP_LIMIT))
-            return true;
+         string orderSymbol = OrderGetString(ORDER_SYMBOL);
+         
+         // 关键改进：通过基础名称匹配（无论带不带 .n 后缀，都能匹配上）
+         if(IsSameBaseSymbol(orderSymbol, _Symbol))
+         {
+            // 如果要全账户同方向排他（不限魔术码），去掉下面的 magic 校验即可
+            if(OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+            {
+               ENUM_ORDER_TYPE ordType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+               
+               if(checkType == POSITION_TYPE_BUY)
+               {
+                  if(ordType == ORDER_TYPE_BUY_LIMIT || ordType == ORDER_TYPE_BUY_STOP || ordType == ORDER_TYPE_BUY_STOP_LIMIT)
+                  {
+                     PrintFormat("【防重复校验】拦截！同基础商品(%s)已存在买入挂单 Ticket:%I64u", orderSymbol, orderTicket);
+                     return true;
+                  }
+               }
+               else if(checkType == POSITION_TYPE_SELL)
+               {
+                  if(ordType == ORDER_TYPE_SELL_LIMIT || ordType == ORDER_TYPE_SELL_STOP || ordType == ORDER_TYPE_SELL_STOP_LIMIT)
+                  {
+                     PrintFormat("【防重复校验】拦截！同基础商品(%s)已存在卖出挂单 Ticket:%I64u", orderSymbol, orderTicket);
+                     return true;
+                  }
+               }
+            }
+         }
       }
    }
    return false;
 }
-
+//+------------------------------------------------------------------+
+//| 修复版：检查是否存在同方向持仓（兼容任意后缀）                     |
+//+------------------------------------------------------------------+
 bool CheckHasSameDirectionPosition(ENUM_POSITION_TYPE checkType)
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      const ulong posTicket = PositionGetTicket(i);
+      ulong posTicket = PositionGetTicket(i);
       if(posTicket == 0) continue;
-      if(PositionSelect(posTicket) && PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+      
+      if(PositionSelectByTicket(posTicket))
       {
-         if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == checkType) return true;
+         string posSymbol = PositionGetString(POSITION_SYMBOL);
+         
+         // 关键改进：模糊/基础名称匹配
+         if(IsSameBaseSymbol(posSymbol, _Symbol))
+         {
+            if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+            {
+               ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+               if(posType == checkType) 
+               {
+                  PrintFormat("【防重复校验】拦截！同基础商品(%s)已存在同方向持仓 Ticket:%I64u", posSymbol, posTicket);
+                  return true; // 存在同方向持仓
+               }
+            }
+         }
       }
    }
    return false;
@@ -334,9 +411,13 @@ void OnTimer()
       return;
    }
    
-   ENUM_POSITION_TYPE targetType = (InitialDirection == DIR_LONG) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+   // 在 OnTimer() 函数中找到对应位置，确认如下逻辑：
+ENUM_POSITION_TYPE targetType = (InitialDirection == DIR_LONG) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
    if(CheckHasSameDirectionPending(targetType) || CheckHasSameDirectionPosition(targetType))
    {
+      PrintFormat("【定时任务】时间: %s，已有同方向单子或挂单，放弃执行，下次触发时间设为: %s", 
+                  TimeToString(serverNow, TIME_DATE|TIME_MINUTES), 
+                  TimeToString(nextAfterThis, TIME_DATE|TIME_MINUTES));
       g_nextTriggerTime = nextAfterThis;
       return;
    }

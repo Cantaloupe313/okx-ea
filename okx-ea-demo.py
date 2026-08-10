@@ -334,7 +334,7 @@ def create_web_app():
 def run_scheduler_blocking():
     set_leverage_safely()
     scheduler = BlockingScheduler(timezone='Asia/Shanghai')
-    scheduler.add_job(execute_strategy, 'cron', minute='0,15,30,45', second='0')
+    scheduler.add_job(execute_strategy, 'cron', minute='0,5,10,15,20,25,30,35,40,45,50,55', second='0')
     scheduler.start()
 
 
@@ -356,7 +356,7 @@ if __name__ == "__main__":
     else:
         set_leverage_safely()
         scheduler = BlockingScheduler(timezone='Asia/Shanghai')
-        scheduler.add_job(execute_strategy, 'cron', minute='0,15,30,45', second='0')
+        scheduler.add_job(execute_strategy, 'cron', minute='0,5,10,15,20,25,30,35,40,45,50,55', second='0')
         print("OKX 策略脚本已启动...")
         try:
             scheduler.start()
