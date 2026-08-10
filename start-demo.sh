@@ -5,6 +5,7 @@
 #   ./start-demo.sh -x live              # 启动实盘
 #   ./start-demo.sh -x demo -amount 20   # 启动模拟盘，指定下单 20 ETH
 
+source venv/bin/activate
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

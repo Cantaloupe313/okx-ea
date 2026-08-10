@@ -1,4 +1,3 @@
-
 import os
 import time
 import argparse
@@ -8,22 +7,16 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from datetime import datetime
 
 # ================= 交易配置区域 =================
-# 交易模式：demo=模拟盘 / live=实盘，由 start-demo.sh -x 传入或环境变量设置
 TRADE_MODE = os.environ.get('OKX_TRADE_MODE', 'demo')
 
-# API 密钥从环境变量读取，不硬编码到代码中（安全：不上云）
 API_KEY = os.environ.get('OKX_API_KEY', '')
 SECRET_KEY = os.environ.get('OKX_SECRET_KEY', '')
 PASSWORD = os.environ.get('OKX_PASSWORD', '')
 
 if not API_KEY or not SECRET_KEY or not PASSWORD:
-    print("【错误】未检测到 OKX API 密钥！请通过以下方式配置：")
-    print("  本地：在 .env 文件中填写密钥，然后用 ./start-demo.sh -x demo 启动")
-    print("  云端：在 Render 控制台 Environment 中设置 OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSWORD")
+    print("【错误】未检测到 OKX API 密钥！")
     raise SystemExit(1)
 
-# 本地代理（国内直连 okx.com 会超时，需走 Clash/V2Ray 等）
-# 海外服务器直连 OKX，PROXY_URL 留空即可；本地使用时设为 Clash/V2Ray 端口
 PROXY_URL = os.environ.get('PROXY_URL', 'http://127.0.0.1:7897')
 
 exchange = ccxt.okx({
@@ -34,58 +27,50 @@ exchange = ccxt.okx({
     'proxies': {'http': PROXY_URL, 'https': PROXY_URL} if PROXY_URL else None,
 })
 
-# === 核心：根据交易模式设置模拟盘/实盘 ===
 IS_DEMO = (TRADE_MODE == 'demo')
 if IS_DEMO:
     exchange.set_sandbox_mode(True)
-    # 显式注入 x-simulated-trading header，双重保险（ccxt.set_sandbox_mode 虽会自动加，但某些版本漏加会导致 50123）
     exchange.headers['x-simulated-trading'] = '1'
     print(f"[交易模式] 模拟盘 (sandbox)")
 else:
     print(f"[交易模式] 实盘 (live) ⚠️ 请确认风险")
-exchange.options['defaultType'] = 'swap'  # 显式锁死为永续合约类型
+exchange.options['defaultType'] = 'swap'
 
 SYMBOL = 'ETH/USDT:USDT'
 LEVERAGE = 50
-# =================================================
 
-# 全局变量：记录上一次成功下初始单的时间（用于2分钟防重复）
+# 策略参数（对齐 MT5 外部参数）
+TP_USD = 4.0               # 止盈 (ETH 美元价格差，原 MT5 SL_USD/TP_USD)
+SL_USD = 4.0               # 止损 (ETH 美元价格差)
+LOT_REVERSE_RATIO = 2.0    # 反向翻仓手数倍率 (2倍)
+CANCEL_DELAY_SEC = 20      # 撤单观察缓冲延迟(秒)
+
 last_order_time = 0
-# 全局：账户持仓模式缓存（net_mode / long_short_mode）
 pos_mode_cache = None
-# 全局：下单数量（单位：ETH），由命令行 -amount 传入，默认 10 ETH
 AMOUNT_ETH = 10.0
 
 
 def parse_args():
-    """解析命令行参数：-amount 指定下单 ETH 数量"""
-    parser = argparse.ArgumentParser(description='OKX 模拟盘 ETH 永续策略')
-    # 注意：argparse 中 -amount 这种单杠多字符选项需显式注册
-    # 环境变量 AMOUNT_ETH 优先级低于命令行参数，用于 Render 部署
+    parser = argparse.ArgumentParser(description='OKX ETH 永续策略 (MT5 同步逻辑版)')
     env_amount = os.environ.get('AMOUNT_ETH', '10.0')
     parser.add_argument('-amount', '--amount', dest='amount',
                         type=float, default=float(env_amount),
-                        help='下单数量(ETH)，默认 10 ETH。例: -amount 10 表示下单 10 ETH')
+                        help='下单数量(ETH)，默认 10 ETH')
     return parser.parse_args()
 
 
 def eth_to_contracts(eth_amount):
-    """将 ETH 数量转换为 OKX 合约张数。
-    OKX ETH/USDT:USDT 永续 1 张 = 0.1 ETH，故 10 ETH = 100 张。
-    """
     market = exchange.market(SYMBOL)
-    contract_size = float(market.get('contractSize', 1)) or 1.0
+    contract_size = float(market.get('contractSize', 1)) or 0.1
     return eth_amount / contract_size
 
 
 def detect_pos_mode():
-    """探测账户持仓模式并缓存，返回 'net_mode' 或 'long_short_mode'"""
     global pos_mode_cache
     if pos_mode_cache is not None:
         return pos_mode_cache
     try:
-        # ccxt 没有直接封装查 posMode，直接走私有接口
-        import requests, hmac, hashlib, base64, json
+        import requests, hmac, hashlib, base64
         from datetime import datetime as _dt, timezone
         ts = _dt.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
         path = '/api/v5/account/config'
@@ -104,74 +89,49 @@ def detect_pos_mode():
         if r.get('code') == '0' and r.get('data'):
             pos_mode_cache = r['data'][0].get('posMode', 'net_mode')
         else:
-            pos_mode_cache = 'long_short_mode'  # 兜底：模拟盘默认双向
+            pos_mode_cache = 'long_short_mode'
     except Exception:
         pos_mode_cache = 'long_short_mode'
     print(f"[持仓模式检测] 当前账户: {pos_mode_cache}")
     return pos_mode_cache
 
 
-def build_order_params(side, position_side, sl_trigger=None, tp_trigger=None):
-    """根据持仓模式构建 create_order params：
-    - long_short_mode 必须显式带 posSide
-    - 止盈止损附带 reduceOnly 保证平仓
-    """
+def build_order_params(position_side, sl_trigger=None, tp_trigger=None, size=None, is_close=False):
+    """构建自带 OKX 原生止盈止损的附加参数"""
     params = {}
     pos_mode = detect_pos_mode()
 
     if pos_mode == 'long_short_mode':
-        params['posSide'] = position_side  # 'long' 或 'short'
+        params['posSide'] = position_side
 
     if sl_trigger is not None or tp_trigger is not None:
-        if pos_mode == 'long_short_mode':
-            close_side = 'buy' if position_side == 'short' else 'sell'
-            extra_for_algo = {'posSide': position_side, 'reduceOnly': True}
-        else:
-            close_side = 'buy' if side == 'sell' else 'sell'
-            extra_for_algo = {}
-
+        algo = {}
         if sl_trigger is not None:
-            params['stopLoss'] = {
-                'type': 'limit',
-                'triggerPrice': sl_trigger,
-                'price': sl_trigger,
-                'side': close_side,
-                **extra_for_algo,
-            }
+            algo['slTriggerPx'] = str(round(sl_trigger, 2))
+            algo['slOrdPx'] = str(round(sl_trigger, 2))
+
         if tp_trigger is not None:
-            params['takeProfit'] = {
-                'type': 'limit',
-                'triggerPrice': tp_trigger,
-                'price': tp_trigger,
-                'side': close_side,
-                **extra_for_algo,
-            }
+            algo['tpTriggerPx'] = str(round(tp_trigger, 2))
+            algo['tpOrdPx'] = str(round(tp_trigger, 2))
+
+        if size is not None:
+            algo['sz'] = str(int(size))
+
+        if pos_mode == 'long_short_mode':
+            algo['posSide'] = position_side
+            if is_close:
+                algo['reduceOnly'] = True
+
+        params['attachAlgoOrds'] = [algo]
+
     return params
-
-
-def has_any_position():
-    """统一处理 net_mode / long_short_mode 的持仓查询"""
-    positions = exchange.fetch_positions([SYMBOL])
-    pos_mode = detect_pos_mode()
-    for pos in positions:
-        contracts = 0
-        if pos.get('contracts'):
-            contracts = float(pos['contracts'])
-        # ccxt 在 long_short_mode 下会给 2 条 record（long / short），都可能是 0
-        if contracts > 0:
-            print(f"检查到当前已有 ETH 持仓: {contracts} 合约, info: {pos.get('info', {}).get('posSide', pos.get('side'))}")
-            return True
-    return False
 
 
 def set_leverage_safely():
     try:
         exchange.load_markets()
-
-        # 不同持仓模式下，set_leverage 需要的 posSide 不同
         pos_mode = detect_pos_mode()
         if pos_mode == 'long_short_mode':
-            # 双向模式下需分 long / short 两边分别设置
             for ps in ('long', 'short'):
                 try:
                     exchange.set_leverage(
@@ -180,162 +140,181 @@ def set_leverage_safely():
                     )
                 except Exception as e:
                     if 'leverage is the same' not in str(e).lower() and 'already' not in str(e).lower():
-                        print(f"  ⚠️  设置 {ps} 边杠杆提示: {e}")
+                        print(f"  ⚠️ 设置 {ps} 边杠杆提示: {e}")
             print(f"[{datetime.now()}] 杠杆已设置为 {LEVERAGE}x (全仓 / {pos_mode})")
         else:
             exchange.set_leverage(LEVERAGE, SYMBOL, params={'marginMode': 'cross'})
             print(f"[{datetime.now()}] 杠杆已成功设置为 {LEVERAGE}x (全仓永续模式 / {pos_mode})")
     except Exception as e:
         print(f"【⚠️ 警告】设置杠杆或市场加载失败: {e}")
-        print("请检查：1. 模拟盘 API Key 是否填错；2. 若持续报 50123 请重新保存 OKX 后台 API Key 交易权限。")
 
-# ================= 辅助函数：等待限价单成交 =================
-def wait_for_order_filled(order_id, timeout=600):
-    """循环轮询，直到订单完全成交或超时"""
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+
+def get_position_details():
+    """获取多空持仓张数详情"""
+    positions = exchange.fetch_positions([SYMBOL])
+    pos_mode = detect_pos_mode()
+    
+    result = {'long': 0.0, 'short': 0.0}
+    for pos in positions:
+        contracts = float(pos.get('contracts', 0) or 0)
+        info_side = pos.get('info', {}).get('posSide', '').lower()
+        ccxt_side = pos.get('side', '').lower()
+        
+        if 'long' in info_side or ccxt_side == 'long':
+            result['long'] += contracts
+        elif 'short' in info_side or ccxt_side == 'short':
+            result['short'] += contracts
+        elif pos_mode == 'net_mode' and contracts > 0:
+            if ccxt_side == 'long':
+                result['long'] += contracts
+            else:
+                result['short'] += contracts
+    return result
+
+
+def cancel_legacy_reverse_orders():
+    """彻底对齐 MT5 CancelAssociatedPendingOrder：安全撤销遗留的反向挂单"""
+    try:
+        open_orders = exchange.fetch_open_orders(SYMBOL)
+        positions = get_position_details()
+
+        # 如果此时已经有了多头持仓（说明止损翻仓成功，挂单已转化为持仓）
+        if positions['long'] > 0:
+            print("【安全跳过】检测到反向多头已触发成交为【持仓】(止损翻仓成功)，程序不做任何平仓干预！")
+            return
+
+        # 否则撤销未成交的反向买入挂单（含常规限价单及条件触发单）
+        print("开始清理遗留的未成交反向多头挂单...")
+        for order in open_orders:
+            if order['side'] == 'buy':
+                try:
+                    exchange.cancel_order(order['id'], SYMBOL)
+                    print(f"【撤单成功】清理反向挂单: {order['id']}")
+                except Exception as ce:
+                    print(f"撤销挂单失败 {order['id']}: {ce}")
+
+        # 清理策略/条件挂单 (Algo Orders)
         try:
-            order = exchange.fetch_order(order_id, SYMBOL)
-            status = order['status']
-            if status == 'closed': # closed 代表完全成交
-                return order
-            elif status == 'canceled':
-                print(f"订单 {order_id} 已被取消。")
-                return None
-            time.sleep(1)
+            pos_mode = detect_pos_mode()
+            params = {'ordType': 'conditional'}
+            algo_orders = exchange.private_get_trade_orders_pending(params)
+            if algo_orders.get('code') == '0':
+                for a_ord in algo_orders.get('data', []):
+                    if a_ord.get('side') == 'buy':
+                        exchange.private_post_trade_cancel_algos({
+                            'algoId': a_ord['algoId'],
+                            'instId': exchange.market_id(SYMBOL)
+                        })
+                        print(f"【撤单成功】清理条件挂单 AlgoID: {a_ord['algoId']}")
         except Exception as e:
-            print(f"轮询订单状态出错: {e}")
-            time.sleep(2)
-    print(f"订单 {order_id} 在 {timeout} 秒内未成交，放弃监听。")
-    return None
+            print(f"检查/清理条件挂单提示: {e}")
 
-# ================= 核心策略执行 =================
+    except Exception as e:
+        print(f"清理反向单过程出现异常: {e}")
+
+
+# ================= 核心策略执行 (对齐 MT5 OnTimer 流程) =================
 def execute_strategy():
     global last_order_time
     now_timestamp = time.time()
 
     print(f"\n====== 策略触发检查: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ======")
 
-    # 1. 检查2分钟内防止重复下单
+    # 1. 防重复触发（对齐 MT5 RepeatGuardMin = 2 分钟）
     if now_timestamp - last_order_time < 120:
         print(f"【防重触发】距离上一次下单未满 2 分钟，跳过本次执行。")
         return
 
     try:
-        # 2. 检查现有的 ETH 持仓状态（兼容双向/单向模式）
-        if has_any_position():
-            print("【条件跳过】当前存在 ETH 已成交持仓，跳过本次下单，等待下一次周期。")
+        open_orders = exchange.fetch_open_orders(SYMBOL)
+        positions = get_position_details()
+        
+        # 2. 检查是否有同方向持仓或挂单 (对齐 MT5 CheckHasSameDirectionPending & CheckHasSameDirectionPosition)
+        has_initial_side_pos = positions['short'] > 0
+        has_initial_side_order = any(o['side'] == 'sell' for o in open_orders)
+        
+        if has_initial_side_pos or has_initial_side_order:
+            print(f"【条件跳过】已存在空头持仓({positions['short']}张) 或 空头挂单，跳过下单。")
             return
 
-        # 3. 检查并撤销所有 ETH 未成交的挂单
-        print("检查是否存在未成交挂单...")
-        open_orders = exchange.fetch_open_orders(SYMBOL)
-        if open_orders:
-            print(f"发现 {len(open_orders)} 笔未成交挂单，正在执行撤单...")
-            for order in open_orders:
-                try:
-                    exchange.cancel_order(order['id'], SYMBOL)
-                    print(f"成功撤单: {order['id']}")
-                except Exception as ce:
-                    print(f"撤单失败 {order['id']}: {ce}")
-        else:
-            print("无可撤销的未成交挂单。")
+        # 3. 观察期检查：无空头持仓，但仍残余反向买单（对应初始单止盈离场后的清理机制）
+        has_reverse_side_order = any(o['side'] == 'buy' for o in open_orders)
+        if positions['short'] == 0 and has_reverse_side_order:
+            print(f"【监控通知】初始持仓已离场！进入 {CANCEL_DELAY_SEC} 秒观察期，防止与止损翻仓冲突...")
+            time.sleep(CANCEL_DELAY_SEC)
+            
+            # 观察期结束后执行安全撤单
+            cancel_legacy_reverse_orders()
+            return
 
-        # 4. 获取市价并计算初始空单限价
+        # 4. 执行开仓（对应 MT5 ExecuteShortOrder）
         ticker = exchange.fetch_ticker(SYMBOL)
-        current_price = ticker['last']
-        short_price = round(current_price - 0.01, 2)
-        # 按 ETH 数量换算为合约张数（OKX ETH 永续 1 张 = 0.1 ETH）
+        bid_price = ticker['bid'] if ticker['bid'] else ticker['last']
+        
+        short_price = round(bid_price, 2)
         short_amount = eth_to_contracts(AMOUNT_ETH)
 
-        print(f"[初始空单] 当前市价: {current_price} -> 计划以 {short_price} 挂限价做空 {AMOUNT_ETH} ETH (={short_amount} 张合约)")
+        # 设置初始空单的 TP / SL
+        short_sl_trigger = round(short_price + SL_USD, 2)  # 止损价
+        short_tp_trigger = round(short_price - TP_USD, 2)  # 止盈价
 
-        # 5. 挂出初始限价空单并附加限价止盈止损
-        short_sl_trigger = round(short_price + 2, 2)
-        short_tp_trigger = round(short_price - 2, 2)
+        print(f"【执行做空】当前 Bid 价: {short_price} | 手数: {AMOUNT_ETH} ETH ({short_amount} 张)")
+        print(f"           止损价: {short_sl_trigger} | 止盈价: {short_tp_trigger}")
 
         short_params = build_order_params(
-            side='sell',
             position_side='short',
             sl_trigger=short_sl_trigger,
             tp_trigger=short_tp_trigger,
+            size=short_amount,
+            is_close=False
         )
 
+        # 发起初始市价/限价做空单
         short_order = exchange.create_order(
-            symbol=SYMBOL, type='limit', side='sell',
-            amount=short_amount, price=short_price, params=short_params
+            symbol=SYMBOL, type='market', side='sell',
+            amount=short_amount, price=None, params=short_params
         )
-        short_id = short_order['id']
-        print(f"成功挂出初始空单(ID: {short_id})，附带限价止损 {short_sl_trigger}，限价止盈 {short_tp_trigger}")
-
-        # 更新成功下单时间，防止2分钟内多重触发
+        print(f"🎉 初始空单提交成功 (ID: {short_order['id']})")
         last_order_time = time.time()
 
-        # 6. 监听初始空单的成交情况
-        print("等待初始空单在市场成交...")
-        filled_short = wait_for_order_filled(short_id, timeout=600)
-        if not filled_short or not (float(filled_short['filled']) > 0):
-            print("初始空单未能成交或已被撤销，结束本次监听。")
-            return
+        # 5. 【关键点对齐】立即同步挂出 2 倍反向 Buy Stop 翻仓单 (对应 MT5 BuyStop 挂单)
+        long_price = short_sl_trigger                         # 触及空单止损价时挂单翻仓
+        long_amount = short_amount * LOT_REVERSE_RATIO        # 2 倍翻仓数量
+        
+        long_tp_trigger = round(long_price + TP_USD, 2)       # 反向多单止盈
+        long_sl_trigger = round(long_price - SL_USD, 2)       # 反向多单止损
 
-        # 7. 开始监听是否触发了"止损"
-        print("初始空单已成交。进入局部盘口监控，等待止损或止盈...")
+        print(f"【预埋翻仓单】同步提交 2 倍 Buy Stop 预埋挂单...")
+        print(f"             触发价(空单止损价): {long_price} | 多单止损: {long_sl_trigger} | 多单止盈: {long_tp_trigger}")
 
-        while True:
-            ticker = exchange.fetch_ticker(SYMBOL)
-            now_price = ticker['last']
+        long_params = build_order_params(
+            position_side='long',
+            sl_trigger=long_sl_trigger,
+            tp_trigger=long_tp_trigger,
+            size=long_amount,
+            is_close=False
+        )
+        
+        # OKX 预埋触发单 (stop-limit / conditional)
+        long_params['stopPrice'] = str(long_price)
+        long_params['orderPx'] = str(long_price)  # 市价触发可填 -1
 
-            if now_price >= short_sl_trigger:
-                print(f"【警报】检测到市场价 {now_price} 已触及空单止损线 {short_sl_trigger}！")
-
-                time.sleep(1.5)
-
-                # 8. 反向翻仓：下限价看涨做多
-                long_price = round(short_sl_trigger + 0.01, 2)
-                # 翻仓数量 = 初始空单张数 × 2
-                long_amount = short_amount * 2
-
-                long_tp_trigger = round(long_price + 2, 2)
-                long_sl_trigger = round(long_price - 2, 2)
-
-                long_params = build_order_params(
-                    side='buy',
-                    position_side='long',
-                    sl_trigger=long_sl_trigger,
-                    tp_trigger=long_tp_trigger,
-                )
-
-                print(f"[反向翻仓] 正在挂出限价做多单，价格: {long_price}, 数量: {long_amount} 张合约")
-                try:
-                    long_order = exchange.create_order(
-                        symbol=SYMBOL, type='limit', side='buy',
-                        amount=long_amount, price=long_price, params=long_params
-                    )
-                    print(f"成功翻仓做多！多单ID: {long_order['id']}，附带限价止损 {long_sl_trigger}，止盈 {long_tp_trigger}")
-                except Exception as e:
-                    print(f"翻仓下单失败: {e}")
-
-                break
-
-            if now_price <= short_tp_trigger:
-                print(f"检测到价格 {now_price} 已触及止盈线 {short_tp_trigger}，空单正常止盈，无需翻仓。")
-                break
-
-            time.sleep(2)
+        exchange.create_order(
+            symbol=SYMBOL,
+            type='stop-limit',
+            side='buy',
+            amount=long_amount,
+            price=long_price,
+            params=long_params
+        )
+        print("🎉 反向 2 倍 Buy Stop 条件挂单预埋成功！")
 
     except Exception as e:
-        print(f"执行过程中发生异常: {e}")
-        if '50123' in str(e) or '50124' in str(e):
-            print("  → 🔴 这是 OKX 后台权限问题！解决方法：")
-            print("     1. 打开 OKX 模拟盘 API 管理页面")
-            print("     2. 点击这个 API Key 的【编辑】按钮")
-            print("     3. 先【取消勾选交易】→ 保存 → 再【重新勾选交易】→ 再保存")
-            print("     4. 或者【删除后重新创建】一个新的 API Key（推荐）")
-            print("     5. 交易市场建议选【全部】避免细粒度子权限遗漏")
+        print(f"执行异常: {e}")
 
-# ================= Web 服务（Render 保活用） =================
+
+# ================= Web 服务（Render 保活） =================
 def create_web_app():
-    """创建轻量 Flask 应用，仅用于 Render 健康检查和保活 ping"""
     from flask import Flask, jsonify
     app = Flask(__name__)
 
@@ -353,37 +332,32 @@ def create_web_app():
 
 
 def run_scheduler_blocking():
-    """启动阻塞式定时调度器（供后台线程调用）"""
     set_leverage_safely()
     scheduler = BlockingScheduler(timezone='Asia/Shanghai')
     scheduler.add_job(execute_strategy, 'cron', minute='0,15,30,45', second='0')
     scheduler.start()
 
 
-# ================= 启动入口 =================
 if __name__ == "__main__":
     args = parse_args()
     AMOUNT_ETH = float(args.amount)
-    print(f"启动配置：下单数量 = {AMOUNT_ETH} ETH")
+    print(f"配置启动：下单数量 = {AMOUNT_ETH} ETH")
 
-    # Render 部署模式：检测 PORT 或 RENDER 环境变量
     render_mode = bool(os.environ.get('PORT') or os.environ.get('RENDER'))
 
     if render_mode:
-        # 后台线程跑调度器，主线程跑 Flask（Render 要求绑定 $PORT）
         scheduler_thread = threading.Thread(target=run_scheduler_blocking, daemon=True)
         scheduler_thread.start()
 
         port = int(os.environ.get('PORT', 8080))
         app = create_web_app()
-        print(f"安全增强版 OKX 策略已启动，Flask 保活服务监听 0.0.0.0:{port}")
+        print(f"OKX 策略已启动，Flask 保活服务监听 0.0.0.0:{port}")
         app.run(host='0.0.0.0', port=port, threaded=True)
     else:
-        # 本地模式：直接阻塞调度器
         set_leverage_safely()
         scheduler = BlockingScheduler(timezone='Asia/Shanghai')
         scheduler.add_job(execute_strategy, 'cron', minute='0,15,30,45', second='0')
-        print("安全增强版 OKX 策略脚本已启动...")
+        print("OKX 策略脚本已启动...")
         try:
             scheduler.start()
         except (KeyboardInterrupt, SystemExit):
