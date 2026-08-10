@@ -1,18 +1,30 @@
 
+import os
 import time
 import argparse
+import threading
 import ccxt
 from apscheduler.schedulers.blocking import BlockingScheduler
 from datetime import datetime
 
-# ================= 模拟盘配置区域 =================
-API_KEY = "1c5edca6-441a-4f1b-9343-40b38645f76e"      # 必须在模拟盘页面生成的KEY
-SECRET_KEY = "B03EDED738DBF5943C98DF9DBA062AED"
-PASSWORD = "As12345678@"
+# ================= 交易配置区域 =================
+# 交易模式：demo=模拟盘 / live=实盘，由 start-demo.sh -x 传入或环境变量设置
+TRADE_MODE = os.environ.get('OKX_TRADE_MODE', 'demo')
+
+# API 密钥从环境变量读取，不硬编码到代码中（安全：不上云）
+API_KEY = os.environ.get('OKX_API_KEY', '')
+SECRET_KEY = os.environ.get('OKX_SECRET_KEY', '')
+PASSWORD = os.environ.get('OKX_PASSWORD', '')
+
+if not API_KEY or not SECRET_KEY or not PASSWORD:
+    print("【错误】未检测到 OKX API 密钥！请通过以下方式配置：")
+    print("  本地：在 .env 文件中填写密钥，然后用 ./start-demo.sh -x demo 启动")
+    print("  云端：在 Render 控制台 Environment 中设置 OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSWORD")
+    raise SystemExit(1)
 
 # 本地代理（国内直连 okx.com 会超时，需走 Clash/V2Ray 等）
-# Clash Verge 默认混合端口 7897；不用代理时设为 None
-PROXY_URL = 'http://127.0.0.1:7897'
+# 海外服务器直连 OKX，PROXY_URL 留空即可；本地使用时设为 Clash/V2Ray 端口
+PROXY_URL = os.environ.get('PROXY_URL', 'http://127.0.0.1:7897')
 
 exchange = ccxt.okx({
     'apiKey': API_KEY,
@@ -22,10 +34,15 @@ exchange = ccxt.okx({
     'proxies': {'http': PROXY_URL, 'https': PROXY_URL} if PROXY_URL else None,
 })
 
-# === 核心：开启 OKX 模拟盘模式并锁定永续合约路由 ===
-exchange.set_sandbox_mode(True)
-# 显式注入 x-simulated-trading header，双重保险（ccxt.set_sandbox_mode 虽会自动加，但某些版本漏加会导致 50123）
-exchange.headers['x-simulated-trading'] = '1'
+# === 核心：根据交易模式设置模拟盘/实盘 ===
+IS_DEMO = (TRADE_MODE == 'demo')
+if IS_DEMO:
+    exchange.set_sandbox_mode(True)
+    # 显式注入 x-simulated-trading header，双重保险（ccxt.set_sandbox_mode 虽会自动加，但某些版本漏加会导致 50123）
+    exchange.headers['x-simulated-trading'] = '1'
+    print(f"[交易模式] 模拟盘 (sandbox)")
+else:
+    print(f"[交易模式] 实盘 (live) ⚠️ 请确认风险")
 exchange.options['defaultType'] = 'swap'  # 显式锁死为永续合约类型
 
 SYMBOL = 'ETH/USDT:USDT'
@@ -44,8 +61,10 @@ def parse_args():
     """解析命令行参数：-amount 指定下单 ETH 数量"""
     parser = argparse.ArgumentParser(description='OKX 模拟盘 ETH 永续策略')
     # 注意：argparse 中 -amount 这种单杠多字符选项需显式注册
+    # 环境变量 AMOUNT_ETH 优先级低于命令行参数，用于 Render 部署
+    env_amount = os.environ.get('AMOUNT_ETH', '10.0')
     parser.add_argument('-amount', '--amount', dest='amount',
-                        type=float, default=10.0,
+                        type=float, default=float(env_amount),
                         help='下单数量(ETH)，默认 10 ETH。例: -amount 10 表示下单 10 ETH')
     return parser.parse_args()
 
@@ -77,8 +96,9 @@ def detect_pos_mode():
             'OK-ACCESS-SIGN': sign,
             'OK-ACCESS-TIMESTAMP': ts,
             'OK-ACCESS-PASSPHRASE': PASSWORD,
-            'x-simulated-trading': '1',
         }
+        if IS_DEMO:
+            hdrs['x-simulated-trading'] = '1'
         proxies = {'http': PROXY_URL, 'https': PROXY_URL} if PROXY_URL else None
         r = requests.get('https://www.okx.com' + path, headers=hdrs, proxies=proxies, timeout=15).json()
         if r.get('code') == '0' and r.get('data'):
@@ -313,21 +333,58 @@ def execute_strategy():
             print("     4. 或者【删除后重新创建】一个新的 API Key（推荐）")
             print("     5. 交易市场建议选【全部】避免细粒度子权限遗漏")
 
-# ================= 定时任务配置 =================
+# ================= Web 服务（Render 保活用） =================
+def create_web_app():
+    """创建轻量 Flask 应用，仅用于 Render 健康检查和保活 ping"""
+    from flask import Flask, jsonify
+    app = Flask(__name__)
+
+    @app.route('/')
+    @app.route('/health')
+    def health():
+        return jsonify({
+            'status': 'running',
+            'symbol': SYMBOL,
+            'amount_eth': AMOUNT_ETH,
+            'last_order_time': last_order_time,
+        })
+
+    return app
+
+
+def run_scheduler_blocking():
+    """启动阻塞式定时调度器（供后台线程调用）"""
+    set_leverage_safely()
+    scheduler = BlockingScheduler(timezone='Asia/Shanghai')
+    scheduler.add_job(execute_strategy, 'cron', minute='0,15,30,45', second='0')
+    scheduler.start()
+
+
+# ================= 启动入口 =================
 if __name__ == "__main__":
-    # 解析命令行参数：-amount 指定下单 ETH 数量
     args = parse_args()
     AMOUNT_ETH = float(args.amount)
     print(f"启动配置：下单数量 = {AMOUNT_ETH} ETH")
 
-    # 启动时先执行一次配置检查
-    set_leverage_safely()
+    # Render 部署模式：检测 PORT 或 RENDER 环境变量
+    render_mode = bool(os.environ.get('PORT') or os.environ.get('RENDER'))
 
-    scheduler = BlockingScheduler(timezone='Asia/Shanghai')
-    scheduler.add_job(execute_strategy, 'cron', minute='0,15,30,45', second='0')
+    if render_mode:
+        # 后台线程跑调度器，主线程跑 Flask（Render 要求绑定 $PORT）
+        scheduler_thread = threading.Thread(target=run_scheduler_blocking, daemon=True)
+        scheduler_thread.start()
 
-    print("安全增强版 OKX 策略脚本已启动...")
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        print("策略已手动停止。")
+        port = int(os.environ.get('PORT', 8080))
+        app = create_web_app()
+        print(f"安全增强版 OKX 策略已启动，Flask 保活服务监听 0.0.0.0:{port}")
+        app.run(host='0.0.0.0', port=port, threaded=True)
+    else:
+        # 本地模式：直接阻塞调度器
+        set_leverage_safely()
+        scheduler = BlockingScheduler(timezone='Asia/Shanghai')
+        scheduler.add_job(execute_strategy, 'cron', minute='0,15,30,45', second='0')
+        print("安全增强版 OKX 策略脚本已启动...")
+        try:
+            scheduler.start()
+        except (KeyboardInterrupt, SystemExit):
+            print("策略已手动停止。")

@@ -1,0 +1,12 @@
+# 环境变量文件（含 API 密钥，不上云）
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 系统
+.DS_Store

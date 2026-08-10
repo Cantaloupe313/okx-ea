@@ -1,0 +1,31 @@
+# Render Blueprint - 一键部署配置
+# 使用方法：将代码推送到 GitHub 后，在 Render 控制台选择 "New > Blueprint"
+# 关联仓库即可自动创建以下服务
+services:
+  - type: web
+    name: okx-ea-demo
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python okx-ea-demo.py
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # 交易模式：demo=模拟盘 / live=实盘
+      - key: OKX_TRADE_MODE
+        value: demo
+      # 敏感信息：在 Render 控制台手动填入实际值（sync: false 表示不写入仓库）
+      - key: OKX_API_KEY
+        sync: false
+      - key: OKX_SECRET_KEY
+        sync: false
+      - key: OKX_PASSWORD
+        sync: false
+      # 海外服务器直连 OKX，必须留空禁用代理
+      - key: PROXY_URL
+        value: ""
+      # 下单数量（ETH），可按需修改
+      - key: AMOUNT_ETH
+        value: "10"
