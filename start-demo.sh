@@ -18,25 +18,29 @@ if [ -f .env ]; then
     set +a
 fi
 
-# 解析参数：-x 模式 / -amount 数量（手动解析以支持多字符选项名）
+# 解析参数：-x 模式 / -amount 数量 / -init-side 初始方向（手动解析以支持多字符选项名）
 MODE=""
 AMOUNT_ARG=""
+INIT_SIDE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -x)
             MODE="$2"; shift 2 ;;
         -amount)
             AMOUNT_ARG="$2"; shift 2 ;;
+        -init-side)
+            INIT_SIDE="$2"; shift 2 ;;
         *)
-            echo "用法: $0 -x demo|live [-amount N]" >&2; exit 1 ;;
+            echo "用法: $0 -x demo|live [-amount N] [-init-side buy|sell]" >&2; exit 1 ;;
     esac
 done
 
 if [ -z "$MODE" ]; then
-    echo "用法: $0 -x demo|live [-amount N]"
+    echo "用法: $0 -x demo|live [-amount N] [-init-side buy|sell]"
     echo "  -x demo        启动模拟盘"
     echo "  -x live        启动实盘"
     echo "  -amount N      下单数量(ETH)，可选，默认读 .env 中 AMOUNT_ETH"
+    echo "  -init-side     初始下单方向，可选：buy（看涨）或 sell（看跌），默认 sell"
     exit 1
 fi
 
@@ -44,6 +48,14 @@ if [ "$MODE" != "demo" ] && [ "$MODE" != "live" ]; then
     echo "错误: -x 参数只支持 demo 或 live"
     exit 1
 fi
+
+# 校验 -init-side 参数
+if [ -n "$INIT_SIDE" ] && [ "$INIT_SIDE" != "buy" ] && [ "$INIT_SIDE" != "sell" ]; then
+    echo "错误: -init-side 参数只支持 buy 或 sell"
+    exit 1
+fi
+
+export OKX_INIT_SIDE="${INIT_SIDE:-sell}"
 
 # 根据模式选择对应的 API 密钥并导出为统一变量名
 if [ "$MODE" = "demo" ]; then
@@ -77,9 +89,5 @@ echo "  数量:   ${AMOUNT_ETH:-10} ETH"
 echo "  代理:   ${PROXY_URL:-无（直连）}"
 echo "========================================"
 
-# 透传 -amount 给 Python（若指定了则覆盖环境变量）
-if [ -n "$AMOUNT_ARG" ]; then
-    python3 okx-ea-demo.py -amount "$AMOUNT_ARG"
-else
-    python3 okx-ea-demo.py
-fi
+# 透传 -amount 和 -init-side 给 Python（若指定了则覆盖环境变量）
+python3 okx-ea-demo.py -amount "${AMOUNT_ARG:-}" -init-side "${INIT_SIDE:-}"

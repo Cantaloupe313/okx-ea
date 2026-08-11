@@ -56,6 +56,10 @@ def parse_args():
     parser.add_argument('-amount', '--amount', dest='amount',
                         type=float, default=float(env_amount),
                         help='下单数量(ETH)，默认 10 ETH')
+    parser.add_argument('-init-side', dest='init_side',
+                        choices=['buy', 'sell'],
+                        default=os.environ.get('OKX_INIT_SIDE', 'sell').lower(),
+                        help='初始下单方向：buy（看涨）或 sell（看跌），默认 sell')
     return parser.parse_args()
 
 
@@ -244,7 +248,7 @@ def execute_strategy():
     try:
         positions = get_position_details()
         open_orders = exchange.fetch_open_orders(SYMBOL)
-        
+
         has_positions = (positions['long'] > 0 or positions['short'] > 0)
         has_open_orders = len(open_orders) > 0
 
@@ -261,55 +265,111 @@ def execute_strategy():
 
         ticker = exchange.fetch_ticker(SYMBOL)
         bid_price = ticker['bid'] if ticker['bid'] else ticker['last']
-        
-        short_price = round(bid_price, 2)
-        short_amount = eth_to_contracts(AMOUNT_ETH)
 
-        short_sl_trigger = round(short_price + SL_USD, 2)
-        short_tp_trigger = round(short_price - TP_USD, 2)
+        # 根据 -init-side 参数决定初始下单方向
+        init_side = args.init_side
+        if init_side == 'buy':
+            # 看涨开仓：先开多单，再埋反向空单
+            print(f"【全新开仓】当前 Bid 价: {bid_price} | 方向: 看涨 | 手数: {AMOUNT_ETH} ETH")
 
-        print(f"【全新开仓】当前 Bid 价: {short_price} | 手数: {AMOUNT_ETH} ETH ({short_amount} 张)")
+            # 1. 市价开多单
+            long_price = round(bid_price, 2)
+            long_amount = eth_to_contracts(AMOUNT_ETH)
 
-        short_params = build_order_params(
-            position_side='short',
-            sl_trigger=short_sl_trigger,
-            tp_trigger=short_tp_trigger,
-            size=short_amount,
-            is_close=False
-        )
+            long_sl_trigger = round(long_price - SL_USD, 2)
+            long_tp_trigger = round(long_price + TP_USD, 2)
 
-        short_order = exchange.create_order(
-            symbol=SYMBOL, type='market', side='sell',
-            amount=short_amount, price=None, params=short_params
-        )
-        print(f"🎉 初始空单提交成功 (ID: {short_order['id']})")
-        last_order_time = time.time()
+            long_params = build_order_params(
+                position_side='long',
+                sl_trigger=long_sl_trigger,
+                tp_trigger=long_tp_trigger,
+                size=long_amount,
+                is_close=False
+            )
 
-        # 预埋 2 倍 Buy Stop 翻仓单
-        long_price = short_sl_trigger
-        long_amount = short_amount * LOT_REVERSE_RATIO
-        long_tp_trigger = round(long_price + TP_USD, 2)
-        long_sl_trigger = round(long_price - SL_USD, 2)
+            long_order = exchange.create_order(
+                symbol=SYMBOL, type='market', side='buy',
+                amount=long_amount, price=None, params=long_params
+            )
+            print(f"🎉 初始多单提交成功 (ID: {long_order['id']})")
+            last_order_time = time.time()
 
-        long_params = build_order_params(
-            position_side='long',
-            sl_trigger=long_sl_trigger,
-            tp_trigger=long_tp_trigger,
-            size=long_amount,
-            is_close=False
-        )
-        long_params['stopPrice'] = str(long_price)
-        long_params['orderPx'] = str(long_price)
+            # 2. 预埋 2 倍 Sell Stop 翻仓单
+            short_price = long_tp_trigger  # 在 TP 处埋空单
+            short_amount = long_amount * LOT_REVERSE_RATIO
+            short_tp_trigger = round(short_price - TP_USD, 2)
+            short_sl_trigger = round(short_price + SL_USD, 2)
 
-        exchange.create_order(
-            symbol=SYMBOL,
-            type='stop-limit',
-            side='buy',
-            amount=long_amount,
-            price=long_price,
-            params=long_params
-        )
-        print("🎉 反向 2 倍 Buy Stop 条件挂单预埋成功！")
+            short_params = build_order_params(
+                position_side='short',
+                sl_trigger=short_sl_trigger,
+                tp_trigger=short_tp_trigger,
+                size=short_amount,
+                is_close=False
+            )
+            short_params['stopPrice'] = str(short_price)
+            short_params['orderPx'] = str(short_price)
+
+            exchange.create_order(
+                symbol=SYMBOL,
+                type='stop-limit',
+                side='sell',
+                amount=short_amount,
+                price=short_price,
+                params=short_params
+            )
+            print("🎉 反向 2 倍 Sell Stop 条件挂单预埋成功！")
+
+        else:  # 默认 sell 方向
+            # 看跌开仓：先开空单，再埋反向多单
+            print(f"【全新开仓】当前 Bid 价: {bid_price} | 方向: 看跌 | 手数: {AMOUNT_ETH} ETH ({long_amount} 张)")
+
+            short_price = round(bid_price, 2)
+            short_amount = eth_to_contracts(AMOUNT_ETH)
+
+            short_sl_trigger = round(short_price + SL_USD, 2)
+            short_tp_trigger = round(short_price - TP_USD, 2)
+
+            short_params = build_order_params(
+                position_side='short',
+                sl_trigger=short_sl_trigger,
+                tp_trigger=short_tp_trigger,
+                size=short_amount,
+                is_close=False
+            )
+
+            short_order = exchange.create_order(
+                symbol=SYMBOL, type='market', side='sell',
+                amount=short_amount, price=None, params=short_params
+            )
+            print(f"🎉 初始空单提交成功 (ID: {short_order['id']})")
+            last_order_time = time.time()
+
+            # 预埋 2 倍 Buy Stop 翻仓单
+            long_price = short_sl_trigger
+            long_amount = short_amount * LOT_REVERSE_RATIO
+            long_tp_trigger = round(long_price + TP_USD, 2)
+            long_sl_trigger = round(long_price - SL_USD, 2)
+
+            long_params = build_order_params(
+                position_side='long',
+                sl_trigger=long_sl_trigger,
+                tp_trigger=long_tp_trigger,
+                size=long_amount,
+                is_close=False
+            )
+            long_params['stopPrice'] = str(long_price)
+            long_params['orderPx'] = str(long_price)
+
+            exchange.create_order(
+                symbol=SYMBOL,
+                type='stop-limit',
+                side='buy',
+                amount=long_amount,
+                price=long_price,
+                params=long_params
+            )
+            print("🎉 反向 2 倍 Buy Stop 条件挂单预埋成功！")
 
     except Exception as e:
         print(f"执行异常: {e}")
