@@ -1,6 +1,6 @@
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "2.4.3"
+#property version   "2.4.4"
 
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh>
@@ -27,7 +27,7 @@ input double LotShortReverse    = 2.0;     // 做多止损反向空手数
 input double TP_USD             = 2.0;     // 止盈(美元，XAUUSD价格差)
 input double SL_USD             = 2.0;     // 止损(美元，XAUUSD价格差)
 input int    RepeatGuardMin     = 2;       // 防重复间隔(分钟)
-input int    CancelDelaySec     = 20;       // 延迟撤单秒数(防止平仓与挂单触发的并发冲突)
+input int    CancelDelaySec     = 10;      // 延迟撤单秒数(防止平仓与挂单触发的并发冲突)
 
 //===== 全局变量 =====
 datetime g_lastTradeTime = 0;        // 上次下单时间戳
@@ -67,28 +67,22 @@ void OnDeinit(const int reason)
    EventKillTimer();
 }
 
-
 //+------------------------------------------------------------------+
-//| 辅助函数：提取商品的基础名称（自动剥离 .n, m, pro 等各种后缀）       |
-//| 例如："XAUUSD.n" -> "XAUUSD" | "EURUSDm" -> "EURUSD"            |
+//| 辅助函数：提取商品的基础名称（自动剥离 .n, m, pro 等各种后缀）         |
+//| 例如："XAUUSD.n" -> "XAUUSD" | "EURUSDm" -> "EURUSD"             |
 //+------------------------------------------------------------------+
 string GetBaseSymbol(string fullSymbol)
 {
-   // 转为大写，避免大小写不一致问题
    StringToUpper(fullSymbol);
    
-   // 常见的外汇/贵金属基础品种长度通常是 6 位（如 XAUUSD, EURUSD）
-   // 如果包含点号 '.'，直接取点号前面的部分
    int dotPos = StringFind(fullSymbol, ".");
    if(dotPos > 0)
    {
       return StringSubstr(fullSymbol, 0, dotPos);
    }
    
-   // 如果不带点号，但长度大于 6（例如 XAUUSDm），尝试截取前 6 位
    if(StringLen(fullSymbol) > 6)
    {
-      // 针对 XAUUSD / BTCUSD 等标准 6 位标的提取
       return StringSubstr(fullSymbol, 0, 6);
    }
    
@@ -104,7 +98,7 @@ bool IsSameBaseSymbol(string symbolA, string symbolB)
 }
 
 //+------------------------------------------------------------------+
-//| 辅助函数：获取当前魔术码最新的持仓 ID                           |
+//| 辅助函数：获取当前魔术码最新的持仓 ID                            |
 //+------------------------------------------------------------------+
 ulong GetLatestPositionID()
 {
@@ -124,7 +118,7 @@ ulong GetLatestPositionID()
 }
 
 //+------------------------------------------------------------------+
-//| 工具函数：准确计算下一个 00/15/30/45 分 00 秒触发点                   |
+//| 工具函数：准确计算下一个 00/15/30/45 分 00 秒触发点                    |
 //+------------------------------------------------------------------+
 datetime CalculateNextTriggerTime(datetime fromTime)
 {
@@ -132,9 +126,17 @@ datetime CalculateNextTriggerTime(datetime fromTime)
    TimeToStruct(fromTime, dt);
    
    int nextMin = 0;
-   if(dt.min < 15)      nextMin = 15;
+   if(dt.min < 5)      nextMin = 5;
+   else if(dt.min < 10)      nextMin = 10;
+   else if(dt.min < 15)      nextMin = 15;
+   else if(dt.min < 20)      nextMin = 20;
+   else if(dt.min < 25)      nextMin = 25;
    else if(dt.min < 30) nextMin = 30;
+   else if(dt.min < 35)      nextMin = 35;
+  else if(dt.min < 40)      nextMin = 40;
    else if(dt.min < 45) nextMin = 45;
+  else if(dt.min < 50)      nextMin = 50;
+ else if(dt.min < 55)      nextMin = 55;
    else                 nextMin = 60;
    
    MqlDateTime nextDt = dt;
@@ -156,9 +158,9 @@ datetime CalculateNextTriggerTime(datetime fromTime)
 }
 
 //+------------------------------------------------------------------+
-//| 修复版：检查是否存在同方向挂单（兼容任意后缀）                     |
+//| 检查是否存在任意方向的未成交挂单（兼容后缀与同魔术码）             |
 //+------------------------------------------------------------------+
-bool CheckHasSameDirectionPending(ENUM_POSITION_TYPE checkType)
+bool CheckHasAnyPendingOrder()
 {
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
@@ -169,40 +171,23 @@ bool CheckHasSameDirectionPending(ENUM_POSITION_TYPE checkType)
       {
          string orderSymbol = OrderGetString(ORDER_SYMBOL);
          
-         // 关键改进：通过基础名称匹配（无论带不带 .n 后缀，都能匹配上）
          if(IsSameBaseSymbol(orderSymbol, _Symbol))
          {
-            // 如果要全账户同方向排他（不限魔术码），去掉下面的 magic 校验即可
             if(OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
             {
-               ENUM_ORDER_TYPE ordType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-               
-               if(checkType == POSITION_TYPE_BUY)
-               {
-                  if(ordType == ORDER_TYPE_BUY_LIMIT || ordType == ORDER_TYPE_BUY_STOP || ordType == ORDER_TYPE_BUY_STOP_LIMIT)
-                  {
-                     PrintFormat("【防重复校验】拦截！同基础商品(%s)已存在买入挂单 Ticket:%I64u", orderSymbol, orderTicket);
-                     return true;
-                  }
-               }
-               else if(checkType == POSITION_TYPE_SELL)
-               {
-                  if(ordType == ORDER_TYPE_SELL_LIMIT || ordType == ORDER_TYPE_SELL_STOP || ordType == ORDER_TYPE_SELL_STOP_LIMIT)
-                  {
-                     PrintFormat("【防重复校验】拦截！同基础商品(%s)已存在卖出挂单 Ticket:%I64u", orderSymbol, orderTicket);
-                     return true;
-                  }
-               }
+               PrintFormat("【防重复校验】拦截！同基础商品(%s)已存在未成交挂单 Ticket:%I64u", orderSymbol, orderTicket);
+               return true;
             }
          }
       }
    }
    return false;
 }
+
 //+------------------------------------------------------------------+
-//| 修复版：检查是否存在同方向持仓（兼容任意后缀）                     |
+//| 检查是否存在任意方向的已成交持仓（兼容后缀与同魔术码）             |
 //+------------------------------------------------------------------+
-bool CheckHasSameDirectionPosition(ENUM_POSITION_TYPE checkType)
+bool CheckHasAnyPosition()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -213,17 +198,12 @@ bool CheckHasSameDirectionPosition(ENUM_POSITION_TYPE checkType)
       {
          string posSymbol = PositionGetString(POSITION_SYMBOL);
          
-         // 关键改进：模糊/基础名称匹配
          if(IsSameBaseSymbol(posSymbol, _Symbol))
          {
             if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
             {
-               ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-               if(posType == checkType) 
-               {
-                  PrintFormat("【防重复校验】拦截！同基础商品(%s)已存在同方向持仓 Ticket:%I64u", posSymbol, posTicket);
-                  return true; // 存在同方向持仓
-               }
+               PrintFormat("【防重复校验】拦截！同基础商品(%s)已存在持仓 Ticket:%I64u", posSymbol, posTicket);
+               return true;
             }
          }
       }
@@ -240,13 +220,12 @@ void SetTradeFillingMode()
 }
 
 //+------------------------------------------------------------------+
-//| 安全撤销关联的反向挂单（绝不影响持仓）                             |
+//| 安全撤销关联的反向挂单（绝不影响持仓）                              |
 //+------------------------------------------------------------------+
 void CancelAssociatedPendingOrder()
 {
    if(g_reverse_order_ticket == INVALID_ORDER_TICKET) return;
    
-   // 只有还在“挂单列表”里（说明未成交），才执行删除
    if(OrderSelect(g_reverse_order_ticket))
    {
       if(trade.OrderDelete(g_reverse_order_ticket))
@@ -256,7 +235,6 @@ void CancelAssociatedPendingOrder()
    }
    else
    {
-      // 找不到挂单，说明已经被交易所转化为“已成交持仓”，绝不触碰！
       PrintFormat("【安全跳过】未在挂单列表中找到Ticket:%d。该反向挂单已触发成交为【持仓】(止损翻仓成功)，程序不做任何平仓干预！", g_reverse_order_ticket);
    }
    
@@ -264,7 +242,7 @@ void CancelAssociatedPendingOrder()
 }
 
 //+------------------------------------------------------------------+
-//| 下单逻辑 (保持不变)                                              |
+//| 下单逻辑                                                         |
 //+------------------------------------------------------------------+
 void ExecuteShortOrder()
 {
@@ -275,7 +253,6 @@ void ExecuteShortOrder()
    
    if(trade.Sell(LotShort, _Symbol, bid, sl_price, tp_price, "Init Short"))
    {
-      // 【修复】：从 trade.ResultDeal() 或当前持仓列表中获取真正的 POSITION_IDENTIFIER
       ulong deal_ticket = trade.ResultDeal();
       if(deal_ticket > 0 && HistoryDealSelect(deal_ticket))
       {
@@ -283,7 +260,6 @@ void ExecuteShortOrder()
       }
       else
       {
-         // 备用方案：如果交易历史延迟，直接在当前持仓中找最新的 Magic 持仓
          g_monitor_position_id = GetLatestPositionID();
       }
 
@@ -305,7 +281,6 @@ void ExecuteLongOrder()
    
    if(trade.Buy(LotLong, _Symbol, ask, sl_price, tp_price, "Init Long"))
    {
-      // 【修复】：获取真正的 POSITION_IDENTIFIER
       ulong deal_ticket = trade.ResultDeal();
       if(deal_ticket > 0 && HistoryDealSelect(deal_ticket))
       {
@@ -313,7 +288,6 @@ void ExecuteLongOrder()
       }
       else
       {
-         // 备用方案
          g_monitor_position_id = GetLatestPositionID();
       }
 
@@ -327,54 +301,46 @@ void ExecuteLongOrder()
 }
 
 //+------------------------------------------------------------------+
-//| 【核心修改】定时器监控初始持仓生命周期，加入延迟撤单缓冲机制       |
+//| 定时器监控初始持仓生命周期                                         |
 //+------------------------------------------------------------------+
 void MonitorPositionStatus()
 {
-   // 1. 如果当前正处于“延迟撤单等待期”
    if(g_pending_cancel_time > 0)
    {
       if(TimeTradeServer() >= g_pending_cancel_time)
       {
          Print("【延迟期结束】开始验证反向挂单状态...");
-         CancelAssociatedPendingOrder(); // 此函数内部会校验挂单是否已成交
-         g_pending_cancel_time = 0;      // 清除延迟标记
+         CancelAssociatedPendingOrder();
+         g_pending_cancel_time = 0;
       }
-      return; // 等待期间不再做其他检查，直接返回
+      return;
    }
 
-   // 2. 如果没有需要监控的初始持仓，直接返回
    if(g_monitor_position_id == INVALID_POSITION_ID) return;
    
-   // 3. 检查初始持仓是否依然在持仓列表中
    bool isStillOpen = false;
-for(int i = PositionsTotal() - 1; i >= 0; i--)
-{
-   const ulong pt = PositionGetTicket(i);
-   if(pt > 0 && PositionSelectByTicket(pt)) // 建议改用 PositionSelectByTicket
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
-         PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
-         PositionGetInteger(POSITION_IDENTIFIER) == (long)g_monitor_position_id)
+      const ulong pt = PositionGetTicket(i);
+      if(pt > 0 && PositionSelectByTicket(pt))
       {
-         isStillOpen = true;
-         break;
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
+            PositionGetInteger(POSITION_IDENTIFIER) == (long)g_monitor_position_id)
+         {
+            isStillOpen = true;
+            break;
+         }
       }
    }
-}
    
-   // 初始持仓未平仓，正常运行
    if(isStillOpen) return;
 
-   // ==========================================
-   // 4. 走到这里，说明初始单刚刚消失（被止盈、止损或手动平仓了）
-   // ==========================================
    PrintFormat("【监控通知】初始持仓(ID:%d)已离场！为防止止损翻仓延迟被误撤单，系统进入 %d 秒观察期...", 
                g_monitor_position_id, CancelDelaySec);
    
-   // 设定几秒后的撤单执行时间，避免与交易所服务器竞态冲突
    g_pending_cancel_time = TimeTradeServer() + CancelDelaySec; 
-   g_monitor_position_id = INVALID_POSITION_ID; // 停止对初始持仓的监控
+   g_monitor_position_id = INVALID_POSITION_ID;
 }
 
 //+------------------------------------------------------------------+
@@ -392,7 +358,6 @@ void OnTimer()
       return;
    }
    
-   // 每秒轮询持仓与挂单的生命周期管理（包含延迟撤单逻辑）
    MonitorPositionStatus();
    
    if(serverNow < g_nextTriggerTime) return;
@@ -411,11 +376,10 @@ void OnTimer()
       return;
    }
    
-   // 在 OnTimer() 函数中找到对应位置，确认如下逻辑：
-ENUM_POSITION_TYPE targetType = (InitialDirection == DIR_LONG) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
-   if(CheckHasSameDirectionPending(targetType) || CheckHasSameDirectionPosition(targetType))
+   // ===== 核心改动：存在任何未成交挂单 或 任何已成交持仓 时，跳过本次定时任务 =====
+   if(CheckHasAnyPendingOrder() || CheckHasAnyPosition())
    {
-      PrintFormat("【定时任务】时间: %s，已有同方向单子或挂单，放弃执行，下次触发时间设为: %s", 
+      PrintFormat("【定时任务】时间: %s，存在未成交委托或已成交仓位，跳过本次执行，下次触发时间设为: %s", 
                   TimeToString(serverNow, TIME_DATE|TIME_MINUTES), 
                   TimeToString(nextAfterThis, TIME_DATE|TIME_MINUTES));
       g_nextTriggerTime = nextAfterThis;

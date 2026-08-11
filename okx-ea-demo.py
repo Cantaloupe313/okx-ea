@@ -24,6 +24,7 @@ exchange = ccxt.okx({
     'secret': SECRET_KEY,
     'password': PASSWORD,
     'enableRateLimit': True,
+    'timeout': 30000,
     'proxies': {'http': PROXY_URL, 'https': PROXY_URL} if PROXY_URL else None,
 })
 
@@ -39,11 +40,10 @@ exchange.options['defaultType'] = 'swap'
 SYMBOL = 'ETH/USDT:USDT'
 LEVERAGE = 50
 
-# 策略参数（对齐 MT5 外部参数）
-TP_USD = 4.0               # 止盈 (ETH 美元价格差，原 MT5 SL_USD/TP_USD)
+# 策略参数
+TP_USD = 4.0               # 止盈 (ETH 美元价格差)
 SL_USD = 4.0               # 止损 (ETH 美元价格差)
 LOT_REVERSE_RATIO = 2.0    # 反向翻仓手数倍率 (2倍)
-CANCEL_DELAY_SEC = 20      # 撤单观察缓冲延迟(秒)
 
 last_order_time = 0
 pos_mode_cache = None
@@ -172,94 +172,103 @@ def get_position_details():
     return result
 
 
-def cancel_legacy_reverse_orders():
-    """彻底对齐 MT5 CancelAssociatedPendingOrder：安全撤销遗留的反向挂单"""
+def cancel_all_algo_orders():
+    """撤销所有残留策略/条件单的辅助函数"""
     try:
-        open_orders = exchange.fetch_open_orders(SYMBOL)
-        positions = get_position_details()
-
-        # 如果此时已经有了多头持仓（说明止损翻仓成功，挂单已转化为持仓）
-        if positions['long'] > 0:
-            print("【安全跳过】检测到反向多头已触发成交为【持仓】(止损翻仓成功)，程序不做任何平仓干预！")
-            return
-
-        # 否则撤销未成交的反向买入挂单（含常规限价单及条件触发单）
-        print("开始清理遗留的未成交反向多头挂单...")
-        for order in open_orders:
-            if order['side'] == 'buy':
-                try:
-                    exchange.cancel_order(order['id'], SYMBOL)
-                    print(f"【撤单成功】清理反向挂单: {order['id']}")
-                except Exception as ce:
-                    print(f"撤销挂单失败 {order['id']}: {ce}")
-
-        # 清理策略/条件挂单 (Algo Orders)
-        try:
-            pos_mode = detect_pos_mode()
-            params = {'ordType': 'conditional'}
-            algo_orders = exchange.private_get_trade_orders_pending(params)
-            if algo_orders.get('code') == '0':
-                for a_ord in algo_orders.get('data', []):
-                    if a_ord.get('side') == 'buy':
-                        exchange.private_post_trade_cancel_algos({
-                            'algoId': a_ord['algoId'],
-                            'instId': exchange.market_id(SYMBOL)
-                        })
-                        print(f"【撤单成功】清理条件挂单 AlgoID: {a_ord['algoId']}")
-        except Exception as e:
-            print(f"检查/清理条件挂单提示: {e}")
-
+        inst_id = exchange.market_id(SYMBOL)
+        algo_orders = fetch_pending_algo_orders()
+        if algo_orders:
+            print(f"【清理残留】检测到 {len(algo_orders)} 笔条件挂单，正在撤销...")
+            cancel_params = [{'algoId': o['algoId'], 'instId': inst_id} for o in algo_orders]
+            exchange.private_post_trade_cancel_algos(cancel_params)
+            time.sleep(1) # 等待撤单生效
     except Exception as e:
-        print(f"清理反向单过程出现异常: {e}")
+        print(f"⚠️ 撤销条件挂单异常: {e}")
 
 
-# ================= 核心策略执行 (对齐 MT5 OnTimer 流程) =================
+def fetch_pending_algo_orders():
+    """查询该品种所有的未成交条件/策略委托单 (Algo Orders)
+
+    说明：通过 attachAlgoOrds 附加的止盈止损单在 OKX 中属于 conditional 类型，
+    因此只查询 conditional 即可，避免多次 API 调用加剧代理/限流压力。
+    """
+    algo_orders = []
+    try:
+        inst_id = exchange.market_id(SYMBOL)
+        res = exchange.private_get_trade_orders_algo_pending({
+            'instId': inst_id,
+            'ordType': 'conditional'
+        })
+        if res.get('code') == '0' and res.get('data'):
+            algo_orders.extend(res['data'])
+    except Exception as e:
+        print(f"  ⚠️ 查询条件挂单异常: {e}")
+    return algo_orders
+
+
+def monitor_and_clean_reverse_orders():
+    """
+    【新增高频监控逻辑】
+    如果检测到当前没有多/空持仓，但是有未触发的反向条件单，
+    说明初始单已经通过止盈触发平仓了，按照要求延迟 10 秒撤销条件单。
+    """
+    try:
+        positions = get_position_details()
+        # 条件：多空都没有持仓
+        if positions['long'] == 0.0 and positions['short'] == 0.0:
+            algo_orders = fetch_pending_algo_orders()
+            if algo_orders:
+                print(f" 🔍 [状态检测] 当前无活跃持仓，但存在 {len(algo_orders)} 笔翻仓条件单。")
+                print(f" ⏳ [延迟处理] 触发 10 秒撤单倒计时...")
+                time.sleep(10)
+                
+                # 再次确认这 10 秒内没有产生新持仓（排除刚好到了 5 分钟定时新开仓的极端重叠情况）
+                double_check_pos = get_position_details()
+                if double_check_pos['long'] == 0.0 and double_check_pos['short'] == 0.0:
+                    cancel_all_algo_orders()
+                    print(" 🎉 [清理完成] 残余翻仓单已成功被清空。")
+    except Exception as e:
+        print(f" ⚠️ 自动监控巡检异常: {e}")
+
+
 def execute_strategy():
     global last_order_time
     now_timestamp = time.time()
 
     print(f"\n====== 策略触发检查: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ======")
 
-    # 1. 防重复触发（对齐 MT5 RepeatGuardMin = 2 分钟）
     if now_timestamp - last_order_time < 120:
         print(f"【防重触发】距离上一次下单未满 2 分钟，跳过本次执行。")
         return
 
     try:
-        open_orders = exchange.fetch_open_orders(SYMBOL)
         positions = get_position_details()
+        open_orders = exchange.fetch_open_orders(SYMBOL)
         
-        # 2. 检查是否有同方向持仓或挂单 (对齐 MT5 CheckHasSameDirectionPending & CheckHasSameDirectionPosition)
-        has_initial_side_pos = positions['short'] > 0
-        has_initial_side_order = any(o['side'] == 'sell' for o in open_orders)
-        
-        if has_initial_side_pos or has_initial_side_order:
-            print(f"【条件跳过】已存在空头持仓({positions['short']}张) 或 空头挂单，跳过下单。")
+        has_positions = (positions['long'] > 0 or positions['short'] > 0)
+        has_open_orders = len(open_orders) > 0
+
+        if has_positions or has_open_orders:
+            reasons = []
+            if has_positions:
+                reasons.append(f"存在持仓 (多头:{positions['long']}张 / 空头:{positions['short']}张)")
+            if has_open_orders:
+                reasons.append(f"存在普通未成交委托 ({len(open_orders)}笔)")
+            print(f"【跳过下单】[{SYMBOL}] " + "，".join(reasons) + "。等待下一次定时检查。")
             return
 
-        # 3. 观察期检查：无空头持仓，但仍残余反向买单（对应初始单止盈离场后的清理机制）
-        has_reverse_side_order = any(o['side'] == 'buy' for o in open_orders)
-        if positions['short'] == 0 and has_reverse_side_order:
-            print(f"【监控通知】初始持仓已离场！进入 {CANCEL_DELAY_SEC} 秒观察期，防止与止损翻仓冲突...")
-            time.sleep(CANCEL_DELAY_SEC)
-            
-            # 观察期结束后执行安全撤单
-            cancel_legacy_reverse_orders()
-            return
+        cancel_all_algo_orders()
 
-        # 4. 执行开仓（对应 MT5 ExecuteShortOrder）
         ticker = exchange.fetch_ticker(SYMBOL)
         bid_price = ticker['bid'] if ticker['bid'] else ticker['last']
         
         short_price = round(bid_price, 2)
         short_amount = eth_to_contracts(AMOUNT_ETH)
 
-        # 设置初始空单的 TP / SL
-        short_sl_trigger = round(short_price + SL_USD, 2)  # 止损价
-        short_tp_trigger = round(short_price - TP_USD, 2)  # 止盈价
+        short_sl_trigger = round(short_price + SL_USD, 2)
+        short_tp_trigger = round(short_price - TP_USD, 2)
 
-        print(f"【执行做空】当前 Bid 价: {short_price} | 手数: {AMOUNT_ETH} ETH ({short_amount} 张)")
-        print(f"           止损价: {short_sl_trigger} | 止盈价: {short_tp_trigger}")
+        print(f"【全新开仓】当前 Bid 价: {short_price} | 手数: {AMOUNT_ETH} ETH ({short_amount} 张)")
 
         short_params = build_order_params(
             position_side='short',
@@ -269,7 +278,6 @@ def execute_strategy():
             is_close=False
         )
 
-        # 发起初始市价/限价做空单
         short_order = exchange.create_order(
             symbol=SYMBOL, type='market', side='sell',
             amount=short_amount, price=None, params=short_params
@@ -277,15 +285,11 @@ def execute_strategy():
         print(f"🎉 初始空单提交成功 (ID: {short_order['id']})")
         last_order_time = time.time()
 
-        # 5. 【关键点对齐】立即同步挂出 2 倍反向 Buy Stop 翻仓单 (对应 MT5 BuyStop 挂单)
-        long_price = short_sl_trigger                         # 触及空单止损价时挂单翻仓
-        long_amount = short_amount * LOT_REVERSE_RATIO        # 2 倍翻仓数量
-        
-        long_tp_trigger = round(long_price + TP_USD, 2)       # 反向多单止盈
-        long_sl_trigger = round(long_price - SL_USD, 2)       # 反向多单止损
-
-        print(f"【预埋翻仓单】同步提交 2 倍 Buy Stop 预埋挂单...")
-        print(f"             触发价(空单止损价): {long_price} | 多单止损: {long_sl_trigger} | 多单止盈: {long_tp_trigger}")
+        # 预埋 2 倍 Buy Stop 翻仓单
+        long_price = short_sl_trigger
+        long_amount = short_amount * LOT_REVERSE_RATIO
+        long_tp_trigger = round(long_price + TP_USD, 2)
+        long_sl_trigger = round(long_price - SL_USD, 2)
 
         long_params = build_order_params(
             position_side='long',
@@ -294,10 +298,8 @@ def execute_strategy():
             size=long_amount,
             is_close=False
         )
-        
-        # OKX 预埋触发单 (stop-limit / conditional)
         long_params['stopPrice'] = str(long_price)
-        long_params['orderPx'] = str(long_price)  # 市价触发可填 -1
+        long_params['orderPx'] = str(long_price)
 
         exchange.create_order(
             symbol=SYMBOL,
@@ -313,7 +315,6 @@ def execute_strategy():
         print(f"执行异常: {e}")
 
 
-# ================= Web 服务（Render 保活） =================
 def create_web_app():
     from flask import Flask, jsonify
     app = Flask(__name__)
@@ -334,7 +335,16 @@ def create_web_app():
 def run_scheduler_blocking():
     set_leverage_safely()
     scheduler = BlockingScheduler(timezone='Asia/Shanghai')
+    
+    # 核心策略：每 5 分钟执行一次检查开仓
     scheduler.add_job(execute_strategy, 'cron', minute='0,5,10,15,20,25,30,35,40,45,50,55', second='0')
+    
+    # 新增监控：每 30 秒巡检一次，负责在止盈后延迟 10s 撤回翻仓条件单
+    scheduler.add_job(
+        monitor_and_clean_reverse_orders, 'interval', seconds=30,
+        max_instances=1, coalesce=True, misfire_grace_time=60
+    )
+    
     scheduler.start()
 
 
@@ -356,7 +366,14 @@ if __name__ == "__main__":
     else:
         set_leverage_safely()
         scheduler = BlockingScheduler(timezone='Asia/Shanghai')
+        
+        # 两处启动区域同步更新任务注册
         scheduler.add_job(execute_strategy, 'cron', minute='0,5,10,15,20,25,30,35,40,45,50,55', second='0')
+        scheduler.add_job(
+            monitor_and_clean_reverse_orders, 'interval', seconds=30,
+            max_instances=1, coalesce=True, misfire_grace_time=60
+        )
+        
         print("OKX 策略脚本已启动...")
         try:
             scheduler.start()
