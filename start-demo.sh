@@ -86,6 +86,8 @@ echo "========================================"
 echo "  OKX EA 启动"
 echo "  模式:   $MODE"
 echo "  数量:   ${AMOUNT_ETH:-10} ETH"
+echo "  止盈:   ${TP_USD:-4.0} USD"
+echo "  止损:   ${SL_USD:-4.0} USD"
 echo "  代理:   ${PROXY_URL:-无（直连）}"
 echo "========================================"
 
