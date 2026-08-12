@@ -1,6 +1,6 @@
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "2.4.5"
+#property version   "2.4.6"
 
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh>
@@ -18,7 +18,7 @@ enum ENUM_INIT_DIRECTION
 };
 
 //===== 外部参数 =====
-input ulong  InpMagicNumber     = 888151;  // EA魔术码(用于区分订单)
+input ulong   InpMagicNumber     = 888151;  // EA魔术码(用于区分订单)
 input ENUM_INIT_DIRECTION InitialDirection = DIR_SHORT; // 初始方向
 input double LotShort           = 1.0;     // 初始做空手数
 input double LotLong            = 1.0;     // 初始做多手数
@@ -30,13 +30,18 @@ input int    RepeatGuardMin     = 2;       // 防重复间隔(分钟)
 input int    CancelDelaySec     = 10;      // 延迟撤单秒数(防止平仓与挂单触发的并发冲突)
 input double TargetNetProfit    = 100000.0;  // 目标净值(达到后全部平仓并停止)
 
+//===== 新增：隔夜库存费规避参数 =====
+input bool   AvoidSwapWednesdayOnly = false; // 是否仅在周三深夜(即周三到周四0点)规避库存费(false则每天规避)
+input int    AvoidSwapBeforeMin     = 10;   // 扣除库存费前停止时间(分钟)
+input int    AvoidSwapAfterMin      = 10;   // 扣除库存费后恢复时间(分钟)
+
 //===== 全局变量 =====
 datetime g_lastTradeTime = 0;        // 上次下单时间戳
 datetime g_nextTriggerTime = 0;      // 下次定时触发时间
 ulong g_monitor_position_id = INVALID_POSITION_ID; // 待监控的持仓唯一ID
 ulong g_reverse_order_ticket = INVALID_ORDER_TICKET; // 关联的反向翻仓挂单Ticket
 datetime g_pending_cancel_time = 0;  // 计划执行撤单的时间 (0表示无计划)
-bool   g_target_reached = false;    // 目标净值是否已达成标志
+bool  g_target_reached = false;    // 目标净值是否已达成标志
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -54,9 +59,9 @@ int OnInit()
    g_nextTriggerTime = CalculateNextTriggerTime(TimeTradeServer());
    
    if(InitialDirection == DIR_SHORT)
-      Print("EA启动，规则：定时自动做空 + 立即挂反向多单");
+      PrintFormat("EA启动，规则：定时自动做空 + 立即挂反向多单 | 目标净值: %.2f", TargetNetProfit);
    else
-      Print("EA启动，规则：定时自动做多 + 立即挂反向空单");
+      PrintFormat("EA启动，规则：定时自动做多 + 立即挂反向空单 | 目标净值: %.2f", TargetNetProfit);
    
    return INIT_SUCCEEDED;
 }
@@ -71,7 +76,6 @@ void OnDeinit(const int reason)
 
 //+------------------------------------------------------------------+
 //| 辅助函数：提取商品的基础名称（自动剥离 .n, m, pro 等各种后缀）         |
-//| 例如："XAUUSD.n" -> "XAUUSD" | "EURUSDm" -> "EURUSD"             |
 //+------------------------------------------------------------------+
 string GetBaseSymbol(string fullSymbol)
 {
@@ -100,7 +104,7 @@ bool IsSameBaseSymbol(string symbolA, string symbolB)
 }
 
 //+------------------------------------------------------------------+
-//| 辅助函数：获取当前魔术码最新的持仓 ID                            |
+//| 辅助函数：获取当前魔术码最新的持仓 ID                             |
 //+------------------------------------------------------------------+
 ulong GetLatestPositionID()
 {
@@ -120,7 +124,7 @@ ulong GetLatestPositionID()
 }
 
 //+------------------------------------------------------------------+
-//| 工具函数：准确计算下一个 00/15/30/45 分 00 秒触发点                    |
+//| 工具函数：准确计算下一个 05/10/15... 分 00 秒触发点                  |
 //+------------------------------------------------------------------+
 datetime CalculateNextTriggerTime(datetime fromTime)
 {
@@ -128,18 +132,18 @@ datetime CalculateNextTriggerTime(datetime fromTime)
    TimeToStruct(fromTime, dt);
    
    int nextMin = 0;
-   if(dt.min < 5)      nextMin = 5;
+   if(dt.min < 5)       nextMin = 5;
    else if(dt.min < 10)      nextMin = 10;
    else if(dt.min < 15)      nextMin = 15;
    else if(dt.min < 20)      nextMin = 20;
    else if(dt.min < 25)      nextMin = 25;
    else if(dt.min < 30) nextMin = 30;
    else if(dt.min < 35)      nextMin = 35;
-  else if(dt.min < 40)      nextMin = 40;
+   else if(dt.min < 40)      nextMin = 40;
    else if(dt.min < 45) nextMin = 45;
-  else if(dt.min < 50)      nextMin = 50;
- else if(dt.min < 55)      nextMin = 55;
-   else                 nextMin = 60;
+   else if(dt.min < 50)      nextMin = 50;
+   else if(dt.min < 55)      nextMin = 55;
+   else                      nextMin = 60;
    
    MqlDateTime nextDt = dt;
    nextDt.min = nextMin % 60;
@@ -151,7 +155,7 @@ datetime CalculateNextTriggerTime(datetime fromTime)
    while(candidate <= fromTime || dt.day_of_week == 0 || dt.day_of_week == 6)
    {
       if(candidate <= fromTime)
-         candidate += 15 * 60; 
+         candidate += 5 * 60; 
       else
          candidate += 3600;    
       TimeToStruct(candidate, dt);
@@ -160,7 +164,7 @@ datetime CalculateNextTriggerTime(datetime fromTime)
 }
 
 //+------------------------------------------------------------------+
-//| 检查是否存在任意方向的未成交挂单（兼容后缀与同魔术码）             |
+//| 检查是否存在任意方向的未成交挂单（兼容后缀与同魔术码）              |
 //+------------------------------------------------------------------+
 bool CheckHasAnyPendingOrder()
 {
@@ -187,7 +191,7 @@ bool CheckHasAnyPendingOrder()
 }
 
 //+------------------------------------------------------------------+
-//| 检查是否存在任意方向的已成交持仓（兼容后缀与同魔术码）             |
+//| 检查是否存在任意方向的已成交持仓（兼容后缀与同魔术码）              |
 //+------------------------------------------------------------------+
 bool CheckHasAnyPosition()
 {
@@ -222,13 +226,10 @@ void SetTradeFillingMode()
 }
 
 //+------------------------------------------------------------------+
-//| 检查并平仓所有持仓、撤单所有挂单，达到目标净值后停止EA运行             |
+//| 检查并平仓所有持仓、撤单所有挂单，达到目标净值后停止EA运行              |
 //+------------------------------------------------------------------+
 void CheckAndCloseAllPositions()
 {
-   PrintFormat("【目标净值检查】当前账户权益: %.2f, 目标净值: %.2f",
-               AccountInfoDouble(ACCOUNT_EQUITY), TargetNetProfit);
-
    if(AccountInfoDouble(ACCOUNT_EQUITY) >= TargetNetProfit)
    {
       Print("【目标净值达成】正在平仓所有持仓并撤单...");
@@ -259,7 +260,6 @@ void CheckAndCloseAllPositions()
          }
       }
 
-      // 等待持仓平仓完成
       Sleep(1000);
 
       // 撤单所有挂单
@@ -286,15 +286,13 @@ void CheckAndCloseAllPositions()
          }
       }
 
-      // 设置标志，停止EA运行
       g_target_reached = true;
-      PrintFormat("【EA终止】目标净值 %.2f 已达成，已平仓所有持仓并撤单所有挂单，EA将不再执行后续交易！", TargetNetProfit);
-      PrintFormat("【终止信息】当前账户权益: %.2f", AccountInfoDouble(ACCOUNT_EQUITY));
+      PrintFormat("【EA终止】目标净值 %.2f 已达成，已平仓所有持仓并撤单所有挂单！", TargetNetProfit);
    }
 }
 
 //+------------------------------------------------------------------+
-//| 安全撤销关联的反向挂单（绝不影响持仓）                              |
+//| 安全撤销关联的反向挂单（绝不影响持仓）                               |
 //+------------------------------------------------------------------+
 void CancelAssociatedPendingOrder()
 {
@@ -303,13 +301,9 @@ void CancelAssociatedPendingOrder()
    if(OrderSelect(g_reverse_order_ticket))
    {
       if(trade.OrderDelete(g_reverse_order_ticket))
-         PrintFormat("【撤单成功】初始持仓已离场，成功撤销关联的未成交挂单，Ticket：%d", g_reverse_order_ticket);
+         PrintFormat("【撤单成功】初始持仓已离场，成功撤销关联的未成交挂单，Ticket：%I64u", g_reverse_order_ticket);
       else
-         PrintFormat("【撤单失败】尝试撤销挂单失败，Ticket：%d，错误码：%d", g_reverse_order_ticket, trade.ResultRetcode());
-   }
-   else
-   {
-      PrintFormat("【安全跳过】未在挂单列表中找到Ticket:%d。该反向挂单已触发成交为【持仓】(止损翻仓成功)，程序不做任何平仓干预！", g_reverse_order_ticket);
+         PrintFormat("【撤单失败】尝试撤销挂单失败，Ticket：%I64u，错误码：%d", g_reverse_order_ticket, trade.ResultRetcode());
    }
    
    g_reverse_order_ticket = INVALID_ORDER_TICKET;
@@ -410,11 +404,53 @@ void MonitorPositionStatus()
    
    if(isStillOpen) return;
 
-   PrintFormat("【监控通知】初始持仓(ID:%d)已离场！为防止止损翻仓延迟被误撤单，系统进入 %d 秒观察期...", 
+   PrintFormat("【监控通知】初始持仓(ID:%I64u)已离场！为防止止损翻仓延迟被误撤单，系统进入 %d 秒观察期...", 
                g_monitor_position_id, CancelDelaySec);
    
    g_pending_cancel_time = TimeTradeServer() + CancelDelaySec; 
    g_monitor_position_id = INVALID_POSITION_ID;
+}
+
+//+------------------------------------------------------------------+
+//| 新增核心函数：检查当前时间是否处于库存费避让窗口                     |
+//+------------------------------------------------------------------+
+bool IsInSwapAvoidWindow(datetime serverTime)
+{
+   MqlDateTime dt;
+   TimeToStruct(serverTime, dt);
+   
+   // 如果开启了“仅在周三规避”，则非周三(dt.day_of_week==3)或非周四前夕直接返回 false
+   // 平台一般在服务器时间周三 23:59:59 进入周四 00:00:00 时扣除3倍库存费
+   if(AvoidSwapWednesdayOnly)
+   {
+      // 窗口可能跨越周三23点到周四0点
+      // 如果是周三，检查是否在 23:(60 - AvoidSwapBeforeMin) 之后
+      if(dt.day_of_week == 3)
+      {
+         if(dt.hour != 23 || dt.min < (60 - AvoidSwapBeforeMin)) 
+            return false;
+      }
+      // 如果是周四，检查是否在 00:AvoidSwapAfterMin 之前
+      else if(dt.day_of_week == 4)
+      {
+         if(dt.hour != 0 || dt.min >= AvoidSwapAfterMin)
+            return false;
+      }
+      else
+      {
+         return false; // 其他日子不限制
+      }
+   }
+   else
+   {
+      // 每天都避开0点前后
+      // 跨深夜0点情况：23点后半段 或 0点前半段
+      if(dt.hour == 23 && dt.min >= (60 - AvoidSwapBeforeMin)) return true;
+      if(dt.hour == 0  && dt.min < AvoidSwapAfterMin) return true;
+      return false;
+   }
+   
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -423,14 +459,22 @@ void MonitorPositionStatus()
 void OnTimer()
 {
    const datetime serverNow = TimeTradeServer();
+   
+   // ===== 核心改动 1：检查是否处于库存费规避时间段 =====
+   if(IsInSwapAvoidWindow(serverNow))
+   {
+      // 处于避让期时，静默跳过，不做任何开仓/监控动作
+      // 重新修正下一次触发时间，确保避让期结束后能立刻重新计算
+      g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
+      return;
+   }
+
    MqlDateTime dt;
    TimeToStruct(serverNow, dt);
 
    // 检查是否已达到目标净值
    if(g_target_reached)
    {
-      PrintFormat("【定时器】目标净值已达成，EA已终止运行，跳过本次定时检查。当前账户权益: %.2f, 目标净值: %.2f",
-                  AccountInfoDouble(ACCOUNT_EQUITY), TargetNetProfit);
       return;
    }
 
@@ -443,7 +487,6 @@ void OnTimer()
    // 检查并执行目标净值平仓逻辑
    CheckAndCloseAllPositions();
 
-   // 如果已达到目标净值，再次检查后直接返回
    if(g_target_reached)
       return;
 
@@ -465,7 +508,6 @@ void OnTimer()
       return;
    }
    
-   // ===== 核心改动：存在任何未成交挂单 或 任何已成交持仓 时，跳过本次定时任务 =====
    if(CheckHasAnyPendingOrder() || CheckHasAnyPosition())
    {
       PrintFormat("【定时任务】时间: %s，存在未成交委托或已成交仓位，跳过本次执行，下次触发时间设为: %s", 
