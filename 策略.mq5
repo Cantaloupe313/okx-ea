@@ -27,7 +27,7 @@ input double LotShortReverse    = 2.0;     // 做多止损反向空手数
 input double TP_USD             = 2.0;     // 止盈(美元，XAUUSD价格差)
 input double SL_USD             = 2.0;     // 止损(美元，XAUUSD价格差)
 input int    RepeatGuardMin     = 2;       // 防重复间隔(分钟)
-input int    CancelDelaySec     = 10;      // 延迟撤单秒数(防止平仓与挂单触发的并发冲突)
+input int    CancelDelaySec     = 5;      // 延迟撤单秒数(防止平仓与挂单触发的并发冲突)
 input double TargetNetProfit    = 100000.0;  // 目标净值(达到后全部平仓并停止)
 
 //===== 新增：隔夜库存费规避参数 =====
