@@ -298,9 +298,6 @@ void ExecuteLongOrder()
    }
 }
 
-//+------------------------------------------------------------------+
-//| 定时器监控持仓与撤单生命周期 (优化)                               |
-//+------------------------------------------------------------------+
 void MonitorPositionStatus()
 {
    // 优先处理观察期延迟撤单逻辑
@@ -333,15 +330,56 @@ void MonitorPositionStatus()
       }
    }
    
-   // 如果初始持仓还在，继续监控，不做处理
+   // 如果初始持仓还在，继续监控
    if(isStillOpen) return;
 
-   // 发现初始持仓已经离场（无论是止盈还是止损）
-   PrintFormat("【监控通知】初始持仓(ID:%I64u)已离场！进入 %d 秒并发保护观察期...", 
-               g_monitor_position_id, CancelDelaySec);
-   
-   g_pending_cancel_time = TimeTradeServer() + CancelDelaySec; 
-   g_monitor_position_id = INVALID_POSITION_ID; // 释放监控ID
+   // === 漏洞修复与逻辑优化 ===
+   // 初始仓位消失了，检查反向挂单的状态，判断是“止盈”还是“止损翻仓”
+   bool isOrderTriggered = false;
+   ulong newPositionID = INVALID_POSITION_ID;
+
+   if(g_reverse_order_ticket != INVALID_ORDER_TICKET)
+   {
+      // 如果挂单在活动订单列表中找不到了，或者状态变了，说明可能触发了
+      if(!OrderSelect(g_reverse_order_ticket) || OrderGetInteger(ORDER_STATE) != ORDER_STATE_PLACED)
+      {
+         isOrderTriggered = true;
+         // 尝试去持仓列表里找由这个MagicNumber生成的、且不是原ID的新持仓
+         for(int i = PositionsTotal() - 1; i >= 0; i--)
+         {
+            ulong pt = PositionGetTicket(i);
+            if(pt > 0 && PositionSelectByTicket(pt))
+            {
+               if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+               {
+                  ulong posID = PositionGetInteger(POSITION_IDENTIFIER);
+                  if(posID != g_monitor_position_id)
+                  {
+                     newPositionID = posID; // 找到了翻仓后的新持仓ID
+                     break;
+                  }
+               }
+            }
+         }
+      }
+   }
+
+   if(isOrderTriggered && newPositionID != INVALID_POSITION_ID)
+   {
+      // 属于【止损翻仓】情况：更新监控ID为新持仓的ID，不执行撤单流程
+      PrintFormat("【监控通知】初始持仓止损离场，反向翻仓单已激活！新持仓ID: %I64u", newPositionID);
+      g_monitor_position_id = newPositionID; 
+      g_reverse_order_ticket = INVALID_ORDER_TICKET; // 挂单已成持仓，释放挂单Ticket
+   }
+   else
+   {
+      // 属于【止盈离场】情况：进入延迟撤单流程
+      PrintFormat("【监控通知】初始持仓(ID:%I64u)已正常止盈离场！进入 %d 秒并发保护观察期...", 
+                  g_monitor_position_id, CancelDelaySec);
+      
+      g_pending_cancel_time = TimeTradeServer() + CancelDelaySec; 
+      g_monitor_position_id = INVALID_POSITION_ID; // 正常释放
+   }
 }
 
 //+------------------------------------------------------------------+
