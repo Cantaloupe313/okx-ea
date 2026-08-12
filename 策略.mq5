@@ -1,6 +1,6 @@
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "2.4.4"
+#property version   "2.4.5"
 
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh>
@@ -28,6 +28,7 @@ input double TP_USD             = 2.0;     // 止盈(美元，XAUUSD价格差)
 input double SL_USD             = 2.0;     // 止损(美元，XAUUSD价格差)
 input int    RepeatGuardMin     = 2;       // 防重复间隔(分钟)
 input int    CancelDelaySec     = 10;      // 延迟撤单秒数(防止平仓与挂单触发的并发冲突)
+input double TargetNetProfit    = 100000.0;  // 目标净值(达到后全部平仓并停止)
 
 //===== 全局变量 =====
 datetime g_lastTradeTime = 0;        // 上次下单时间戳
@@ -35,6 +36,7 @@ datetime g_nextTriggerTime = 0;      // 下次定时触发时间
 ulong g_monitor_position_id = INVALID_POSITION_ID; // 待监控的持仓唯一ID
 ulong g_reverse_order_ticket = INVALID_ORDER_TICKET; // 关联的反向翻仓挂单Ticket
 datetime g_pending_cancel_time = 0;  // 计划执行撤单的时间 (0表示无计划)
+bool   g_target_reached = false;    // 目标净值是否已达成标志
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -220,6 +222,78 @@ void SetTradeFillingMode()
 }
 
 //+------------------------------------------------------------------+
+//| 检查并平仓所有持仓、撤单所有挂单，达到目标净值后停止EA运行             |
+//+------------------------------------------------------------------+
+void CheckAndCloseAllPositions()
+{
+   PrintFormat("【目标净值检查】当前账户权益: %.2f, 目标净值: %.2f",
+               AccountInfoDouble(ACCOUNT_EQUITY), TargetNetProfit);
+
+   if(AccountInfoDouble(ACCOUNT_EQUITY) >= TargetNetProfit)
+   {
+      Print("【目标净值达成】正在平仓所有持仓并撤单...");
+
+      // 平仓所有持仓
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong posTicket = PositionGetTicket(i);
+         if(posTicket == 0) continue;
+
+         if(PositionSelectByTicket(posTicket))
+         {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+               PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+            {
+               long posType = PositionGetInteger(POSITION_TYPE);
+               if(trade.PositionClose(posTicket))
+               {
+                  PrintFormat("【平仓成功】Ticket: %I64u, 类型: %s", posTicket,
+                              (posType == POSITION_TYPE_BUY ? "多单" : "空单"));
+               }
+               else
+               {
+                  PrintFormat("【平仓失败】Ticket: %I64u, 错误码: %d",
+                              posTicket, trade.ResultRetcode());
+               }
+            }
+         }
+      }
+
+      // 等待持仓平仓完成
+      Sleep(1000);
+
+      // 撤单所有挂单
+      for(int i = OrdersTotal() - 1; i >= 0; i--)
+      {
+         ulong orderTicket = OrderGetTicket(i);
+         if(orderTicket == 0) continue;
+
+         if(OrderSelect(orderTicket))
+         {
+            if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
+               OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+            {
+               if(trade.OrderDelete(orderTicket))
+               {
+                  PrintFormat("【撤单成功】Ticket: %I64u", orderTicket);
+               }
+               else
+               {
+                  PrintFormat("【撤单失败】Ticket: %I64u, 错误码: %d",
+                              orderTicket, trade.ResultRetcode());
+               }
+            }
+         }
+      }
+
+      // 设置标志，停止EA运行
+      g_target_reached = true;
+      PrintFormat("【EA终止】目标净值 %.2f 已达成，已平仓所有持仓并撤单所有挂单，EA将不再执行后续交易！", TargetNetProfit);
+      PrintFormat("【终止信息】当前账户权益: %.2f", AccountInfoDouble(ACCOUNT_EQUITY));
+   }
+}
+
+//+------------------------------------------------------------------+
 //| 安全撤销关联的反向挂单（绝不影响持仓）                              |
 //+------------------------------------------------------------------+
 void CancelAssociatedPendingOrder()
@@ -350,14 +424,29 @@ void OnTimer()
 {
    const datetime serverNow = TimeTradeServer();
    MqlDateTime dt;
-   TimeToStruct(serverNow, dt); 
-   
+   TimeToStruct(serverNow, dt);
+
+   // 检查是否已达到目标净值
+   if(g_target_reached)
+   {
+      PrintFormat("【定时器】目标净值已达成，EA已终止运行，跳过本次定时检查。当前账户权益: %.2f, 目标净值: %.2f",
+                  AccountInfoDouble(ACCOUNT_EQUITY), TargetNetProfit);
+      return;
+   }
+
    if(dt.day_of_week == 0 || dt.day_of_week == 6)
    {
       g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
       return;
    }
-   
+
+   // 检查并执行目标净值平仓逻辑
+   CheckAndCloseAllPositions();
+
+   // 如果已达到目标净值，再次检查后直接返回
+   if(g_target_reached)
+      return;
+
    MonitorPositionStatus();
    
    if(serverNow < g_nextTriggerTime) return;
