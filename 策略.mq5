@@ -1,6 +1,6 @@
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "2.4.7"
+#property version   "2.4.8"
 
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh>
@@ -257,7 +257,23 @@ void CancelAssociatedPendingOrder()
 void ExecuteShortOrder()
 {
    SetTradeFillingMode();
-   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("【错误】获取Tick失败，错误码: ", GetLastError());
+      return;
+   }
+
+   // 打印诊断信息（非常重要）
+   PrintFormat("【诊断】品种: %s | Tick时间: %s | 服务器时间: %s | Bid: %.5f | Ask: %.5f | 点差: %d",
+               _Symbol,
+               TimeToString(tick.time, TIME_DATE|TIME_SECONDS),
+               TimeToString(TimeTradeServer(), TIME_DATE|TIME_SECONDS),
+               tick.bid, tick.ask,
+               (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD));
+   
+   const double bid = tick.bid;
    const double sl_price = NormalizeDouble(bid + SL_USD, _Digits);
    const double tp_price = NormalizeDouble(bid - TP_USD, _Digits);
    
@@ -274,12 +290,35 @@ void ExecuteShortOrder()
          
       PrintFormat("【初始做空成功】持仓ID: %I64u, 反向挂单Ticket: %I64u", g_monitor_position_id, g_reverse_order_ticket);
    }
+   else
+   {
+      // 把开仓价也打出来，方便排查 invalid stops
+      PrintFormat("【初始做空失败】价格: %.5f  SL: %.5f  TP: %.5f  错误码: %d (%s)",
+                  bid, sl_price, tp_price,
+                  trade.ResultRetcode(), trade.ResultRetcodeDescription());
+   }
 }
 
 void ExecuteLongOrder()
 {
    SetTradeFillingMode();
-   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("【错误】获取Tick失败，错误码: ", GetLastError());
+      return;
+   }
+
+   // 打印诊断信息（非常重要）
+   PrintFormat("【诊断】品种: %s | Tick时间: %s | 服务器时间: %s | Bid: %.5f | Ask: %.5f | 点差: %d",
+               _Symbol,
+               TimeToString(tick.time, TIME_DATE|TIME_SECONDS),
+               TimeToString(TimeTradeServer(), TIME_DATE|TIME_SECONDS),
+               tick.bid, tick.ask,
+               (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD));
+   
+   const double ask = tick.ask;
    const double sl_price = NormalizeDouble(ask - SL_USD, _Digits);
    const double tp_price = NormalizeDouble(ask + TP_USD, _Digits);
    
@@ -295,6 +334,13 @@ void ExecuteLongOrder()
          g_reverse_order_ticket = trade.ResultOrder();
 
       PrintFormat("【初始做多成功】持仓ID: %I64u, 反向挂单Ticket: %I64u", g_monitor_position_id, g_reverse_order_ticket);
+   }
+   else
+   {
+      // 把开仓价也打出来，方便排查 invalid stops
+      PrintFormat("【初始做多失败】价格: %.5f  SL: %.5f  TP: %.5f  错误码: %d (%s)",
+                  ask, sl_price, tp_price,
+                  trade.ResultRetcode(), trade.ResultRetcodeDescription());
    }
 }
 
