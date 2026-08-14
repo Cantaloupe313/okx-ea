@@ -1,9 +1,9 @@
 #!/bin/bash
 # OKX EA 启动脚本
 # 用法：
-#   ./start-demo.sh -x demo              # 启动模拟盘（数量用 .env 中的 AMOUNT_ETH）
-#   ./start-demo.sh -x live              # 启动实盘
-#   ./start-demo.sh -x demo -amount 20   # 启动模拟盘，指定下单 20 ETH
+#   ./start.sh -x demo              # 启动模拟盘（数量用 .env 中的 AMOUNT_ETH）
+#   ./start.sh -x live              # 启动实盘
+#   ./start.sh -x demo -amount 20   # 启动模拟盘，指定下单 20 ETH
 
 source venv/bin/activate
 set -e
@@ -92,4 +92,4 @@ echo "  代理:   ${PROXY_URL:-无（直连）}"
 echo "========================================"
 
 # 透传 -amount 和 -init-side 给 Python（若指定了则覆盖环境变量）
-python3 okx-ea-demo.py -amount "${AMOUNT_ARG:-}" -init-side "${INIT_SIDE:-}"
+python3 okx-ea.py -amount "${AMOUNT_ARG:-}" -init-side "${INIT_SIDE:-}"
