@@ -3,29 +3,92 @@
 # 关联仓库即可自动创建以下服务
 services:
   - type: web
-    name: okx-ea-demo
+    name: okx-ea
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python okx-ea-demo.py
+    startCommand: python okx-ea.py
     plan: free
     autoDeploy: true
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: "3.11"
       # 交易模式：demo=模拟盘 / live=实盘
       - key: OKX_TRADE_MODE
         value: demo
+      # 策略目标净值（USDT）
+      - key: TARGET_NETPROFIT
+        value: "100"
+      # 下单数量（ETH）
+      - key: AMOUNT_ETH
+        value: "10"
+      # 初始下单方向：buy（看涨）或 sell（看跌）
+      - key: OKX_INIT_SIDE
+        value: "sell"
+      # 止盈/止损价差（USD）
+      - key: TP_USD
+        value: "4"
+      - key: SL_USD
+        value: "4"
+      # 反向翻仓倍数
+      - key: LOT_REVERSE_RATIO
+        value: "2"
+      # 杠杆倍数
+      - key: LEVERAGE
+        value: "50"
       # 敏感信息：在 Render 控制台手动填入实际值（sync: false 表示不写入仓库）
-      - key: OKX_API_KEY
+      - key: OKX_DEMO_API_KEY
         sync: false
-      - key: OKX_SECRET_KEY
+      - key: OKX_DEMO_SECRET_KEY
         sync: false
-      - key: OKX_PASSWORD
+      - key: OKX_DEMO_PASSWORD
+        sync: false
+      - key: OKX_LIVE_API_KEY
+        sync: false
+      - key: OKX_LIVE_SECRET_KEY
+        sync: false
+      - key: OKX_LIVE_PASSWORD
         sync: false
       # 海外服务器直连 OKX，必须留空禁用代理
       - key: PROXY_URL
         value: ""
-      # 下单数量（ETH），可按需修改
+        value: "3.11"
+      # 交易模式：demo=模拟盘 / live=实盘
+      - key: OKX_TRADE_MODE
+        value: demo
+      # 策略目标净值（USDT）
+      - key: TARGET_NETPROFIT
+        value: "100"
+      # 下单数量（ETH）
       - key: AMOUNT_ETH
         value: "10"
+      # 初始下单方向：buy（看涨）或 sell（看跌）
+      - key: OKX_INIT_SIDE
+        value: "sell"
+      # 止盈/止损价差（USD）
+      - key: TP_USD
+        value: "4"
+      - key: SL_USD
+        value: "4"
+      # 反向翻仓倍数
+      - key: LOT_REVERSE_RATIO
+        value: "2"
+      # 杠杆倍数
+      - key: LEVERAGE
+        value: "50"
+      # 敏感信息：在 Render 控制台手动填入实际值（sync: false 表示不写入仓库）
+      - key: OKX_DEMO_API_KEY
+        sync: false
+      - key: OKX_DEMO_SECRET_KEY
+        sync: false
+      - key: OKX_DEMO_PASSWORD
+        sync: false
+      - key: OKX_LIVE_API_KEY
+        sync: false
+      - key: OKX_LIVE_SECRET_KEY
+        sync: false
+      - key: OKX_LIVE_PASSWORD
+        sync: false
+      # 海外服务器直连 OKX，必须留空禁用代理
+      - key: PROXY_URL
+        value: ""
