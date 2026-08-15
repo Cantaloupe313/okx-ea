@@ -241,37 +241,53 @@ def eth_to_contracts(eth_amount):
 
 
 def get_position_details():
-    """获取当前持仓详情（返回多头和空头张数）"""
-    try:
-        # 根据持仓模式获取持仓
-        if detect_pos_mode() == 'long_short_mode':
-            # 分离多头和空头
-            all_positions = exchange.fetch_positions([SYMBOL])
-            long_count = 0
-            short_count = 0
-            for pos in all_positions:
-                if pos.get('symbol') == SYMBOL:
-                    if pos.get('side') == 'long':
-                        long_count += abs(float(pos.get('contracts', 0)))
-                    elif pos.get('side') == 'short':
-                        short_count += abs(float(pos.get('contracts', 0)))
-            return {'long': long_count, 'short': short_count}
-        else:
-            # net_mode 模式下，正数多头，负数空头
-            positions = exchange.fetch_positions([SYMBOL])
-            long_count = 0
-            short_count = 0
-            for pos in positions:
-                if pos.get('symbol') == SYMBOL:
-                    contracts = float(pos.get('contracts', 0))
-                    if contracts > 0:
-                        long_count += contracts
-                    else:
-                        short_count += abs(contracts)
-            return {'long': long_count, 'short': short_count}
-    except Exception as e:
-        print(f"⚠️ [获取持仓] 异常: {e}")
-        return {'long': 0, 'short': 0}
+    """获取当前持仓详情（返回多头和空头张数），带重试和更稳健的参数"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 明确指定 instType，避免部分环境下解析问题
+            params = {'instType': 'SWAP'}
+            
+            if detect_pos_mode() == 'long_short_mode':
+                all_positions = exchange.fetch_positions([SYMBOL], params=params)
+                long_count = 0.0
+                short_count = 0.0
+                for pos in all_positions:
+                    if pos.get('symbol') == SYMBOL:
+                        contracts = abs(float(pos.get('contracts') or 0))
+                        if pos.get('side') == 'long':
+                            long_count += contracts
+                        elif pos.get('side') == 'short':
+                            short_count += contracts
+                return {'long': long_count, 'short': short_count}
+            else:
+                # net_mode
+                positions = exchange.fetch_positions([SYMBOL], params=params)
+                long_count = 0.0
+                short_count = 0.0
+                for pos in positions:
+                    if pos.get('symbol') == SYMBOL:
+                        contracts = float(pos.get('contracts') or 0)
+                        if contracts > 0:
+                            long_count += contracts
+                        elif contracts < 0:
+                            short_count += abs(contracts)
+                return {'long': long_count, 'short': short_count}
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"⚠️ [获取持仓] 第 {attempt + 1}/{max_retries} 次异常: {error_msg}")
+            
+            # 如果是最后一次还失败，打印更详细信息
+            if attempt == max_retries - 1:
+                import traceback
+                traceback.print_exc()
+                return {'long': 0, 'short': 0}
+            
+            # 短暂等待后重试
+            time.sleep(1.5)
+    
+    return {'long': 0, 'short': 0}
 
 
 def detect_pos_mode():
