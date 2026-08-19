@@ -52,7 +52,6 @@ services:
       # 海外服务器直连 OKX，必须留空禁用代理
       - key: PROXY_URL
         value: ""
-        value: "3.11"
       # 交易模式：demo=模拟盘 / live=实盘
       - key: OKX_TRADE_MODE
         value: demo
