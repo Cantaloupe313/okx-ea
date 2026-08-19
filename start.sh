@@ -92,4 +92,4 @@ echo "  代理:   ${PROXY_URL:-无（直连）}"
 echo "========================================"
 
 # 透传 -amount 和 -init-side 给 Python（若指定了则覆盖环境变量）
-python3 okx-ea.py -amount "${AMOUNT_ARG:-}" -init-side "${INIT_SIDE:-}"
+python3 -u okx-ea.py -amount "${AMOUNT_ARG:-}" -init-side "${INIT_SIDE:-}"
