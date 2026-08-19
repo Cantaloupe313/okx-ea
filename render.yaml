@@ -15,27 +15,27 @@ services:
         value: "3.11"
       # 交易模式：demo=模拟盘 / live=实盘
       - key: OKX_TRADE_MODE
-        value: demo
+        sync:false
       # 策略目标净值（USDT）
       - key: TARGET_NETPROFIT
-        value: "100"
+        sync:false
       # 下单数量（ETH）
       - key: AMOUNT_ETH
-        value: "10"
+        sync:false
       # 初始下单方向：buy（看涨）或 sell（看跌）
       - key: OKX_INIT_SIDE
-        value: "sell"
+        sync:false
       # 止盈/止损价差（USD）
       - key: TP_USD
-        value: "4"
+        sync:false
       - key: SL_USD
-        value: "4"
+        sync:false
       # 反向翻仓倍数
       - key: LOT_REVERSE_RATIO
-        value: "2"
+        sync:false
       # 杠杆倍数
       - key: LEVERAGE
-        value: "50"
+        sync:false
       # 敏感信息：在 Render 控制台手动填入实际值（sync: false 表示不写入仓库）
       - key: OKX_DEMO_API_KEY
         sync: false
@@ -52,42 +52,4 @@ services:
       # 海外服务器直连 OKX，必须留空禁用代理
       - key: PROXY_URL
         value: ""
-      # 交易模式：demo=模拟盘 / live=实盘
-      - key: OKX_TRADE_MODE
-        value: demo
-      # 策略目标净值（USDT）
-      - key: TARGET_NETPROFIT
-        value: "100"
-      # 下单数量（ETH）
-      - key: AMOUNT_ETH
-        value: "10"
-      # 初始下单方向：buy（看涨）或 sell（看跌）
-      - key: OKX_INIT_SIDE
-        value: "sell"
-      # 止盈/止损价差（USD）
-      - key: TP_USD
-        value: "4"
-      - key: SL_USD
-        value: "4"
-      # 反向翻仓倍数
-      - key: LOT_REVERSE_RATIO
-        value: "2"
-      # 杠杆倍数
-      - key: LEVERAGE
-        value: "50"
-      # 敏感信息：在 Render 控制台手动填入实际值（sync: false 表示不写入仓库）
-      - key: OKX_DEMO_API_KEY
-        sync: false
-      - key: OKX_DEMO_SECRET_KEY
-        sync: false
-      - key: OKX_DEMO_PASSWORD
-        sync: false
-      - key: OKX_LIVE_API_KEY
-        sync: false
-      - key: OKX_LIVE_SECRET_KEY
-        sync: false
-      - key: OKX_LIVE_PASSWORD
-        sync: false
-      # 海外服务器直连 OKX，必须留空禁用代理
-      - key: PROXY_URL
-        value: ""
+      
