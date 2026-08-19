@@ -1,6 +1,6 @@
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "2.4.8"
+#property version   "2.4.9"
 
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh>
@@ -29,6 +29,7 @@ input double SL_USD             = 3;     // 止损(美元，XAUUSD价格差)
 input int    RepeatGuardMin     = 2;       // 防重复间隔(分钟)
 input int    CancelDelaySec     = 5;      // 延迟撤单秒数(防止平仓与挂单触发的并发冲突)
 input double TargetNetProfit    = 10050.0;  // 目标净值(达到后全部平仓并停止)
+input double MaxDrawdownPct     = 50.0;    // 最大回撤率(%)，达到后终止EA并清仓
 
 //===== 隔夜库存费规避参数 =====
 input bool   AvoidSwapWednesdayOnly = false; // 是否仅在周三深夜规避库存费
@@ -42,6 +43,8 @@ ulong g_monitor_position_id = INVALID_POSITION_ID; // 待监控的持仓唯一ID
 ulong g_reverse_order_ticket = INVALID_ORDER_TICKET; // 关联的反向翻仓挂单Ticket
 datetime g_pending_cancel_time = 0;  // 计划执行撤单的时间 (0表示无计划)
 bool  g_target_reached = false;    // 目标净值是否已达成标志
+double g_max_drawdown = 0.0;        // 当前最大回撤(美元)
+bool  g_stop_on_drawdown = false;   // 是否因回撤停止标志
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -120,7 +123,7 @@ datetime CalculateNextTriggerTime(datetime fromTime)
    TimeToStruct(fromTime, dt);
    
    // 计算下一个15分钟的整数倍分钟数
-   int nextMin = ((dt.min / 15) + 1) * 15;
+   int nextMin = ((dt.min / 5) + 1) * 5;
    
    MqlDateTime nextDt = dt;
    nextDt.min = nextMin % 60;   // 超过60分钟会自动取模
@@ -133,7 +136,7 @@ datetime CalculateNextTriggerTime(datetime fromTime)
    while(candidate <= fromTime || dt.day_of_week == 0 || dt.day_of_week == 6)
    {
       if(candidate <= fromTime) 
-         candidate += 15 * 60;  // 每次递增15分钟
+         candidate += 5 * 60;  // 每次递增15分钟
       else 
          candidate += 3600;     // 周末跳过
          
@@ -188,14 +191,102 @@ void SetTradeFillingMode()
 }
 
 //+------------------------------------------------------------------+
+//| 回撤止损：停止EA并清仓清单                                         |
+//+------------------------------------------------------------------+
+void StopEAAndClean()
+{
+   PrintFormat("【回撤保护】回撤率 %.2f%% 已达到阈值 %.2f%%，终止EA并清理仓位！", g_max_drawdown / (AccountInfoDouble(ACCOUNT_MARGIN_LEVEL) * AccountInfoDouble(ACCOUNT_MARGIN)) * 100, MaxDrawdownPct);
+
+   // 清理所有仓位
+   int closedCount = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong posTicket = PositionGetTicket(i);
+      if(posTicket > 0 && PositionSelectByTicket(posTicket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+         {
+            if(trade.PositionClose(posTicket))
+               closedCount++;
+            Sleep(200);
+         }
+      }
+   }
+
+   // 清理所有委托
+   int deletedCount = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong orderTicket = OrderGetTicket(i);
+      if(orderTicket > 0 && OrderSelect(orderTicket))
+      {
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+         {
+            if(trade.OrderDelete(orderTicket))
+               deletedCount++;
+            Sleep(200);
+         }
+      }
+   }
+
+   PrintFormat("【回撤保护】已平仓 %d 个仓位，已撤销 %d 个委托。EA已停止运行。", closedCount, deletedCount);
+}
+
+//+------------------------------------------------------------------+
+//| 计算并检查最大回撤                                                   |
+//+------------------------------------------------------------------+
+void CalculateMaxDrawdown()
+{
+   double currentEquity = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_PROFIT);
+   static double highestEquity = 0.0;
+
+   // 首次调用时，记录初始权益作为基准（此时 g_max_drawdown 应该为 0）
+   if(g_max_drawdown == 0.0 && highestEquity == 0.0)
+   {
+      highestEquity = currentEquity;
+      g_max_drawdown = 0.0;
+      return;
+   }
+
+   // 计算回撤百分比（相对于历史最高权益）
+   double drawdownPct = 0.0;
+   if(highestEquity > 0.0)
+   {
+      drawdownPct = ((highestEquity - currentEquity) / highestEquity) * 100.0;
+   }
+
+   g_max_drawdown = highestEquity - currentEquity;
+
+   // 更新历史最高权益
+   if(currentEquity > highestEquity)
+   {
+      highestEquity = currentEquity;
+   }
+
+   // 如果回撤超过阈值，触发停止
+   if(drawdownPct >= MaxDrawdownPct && !g_stop_on_drawdown)
+   {
+      PrintFormat("【回撤保护】检测到回撤率 %.2f%%，达到阈值 %.2f%%，立即停止EA并清仓！", drawdownPct, MaxDrawdownPct);
+      g_stop_on_drawdown = true;
+      StopEAAndClean();
+   }
+}
+
+//+------------------------------------------------------------------+
 //| 检查目标净值                                                     |
 //+------------------------------------------------------------------+
 void CheckAndCloseAllPositions()
 {
+   // 检查回撤是否达到阈值
+   CalculateMaxDrawdown();
+
+   // 如果已经因回撤停止，不再执行任何操作
+   if(g_stop_on_drawdown) return;
+
    if(AccountInfoDouble(ACCOUNT_EQUITY) >= TargetNetProfit)
    {
       Print("【目标净值达成】正在全面清仓与撤单...");
-      
+
       // 平仓
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
@@ -462,7 +553,10 @@ bool IsInSwapAvoidWindow(datetime serverTime)
 void OnTimer()
 {
    const datetime serverNow = TimeTradeServer();
-   
+
+   // ===== 回撤保护优先级最高 =====
+   if(g_stop_on_drawdown) return;
+
    // ===== 核心逻辑优化：生命周期监控与目标净值检查不受避让窗影响 =====
    if(g_target_reached) return;
 
