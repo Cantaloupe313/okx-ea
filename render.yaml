@@ -2,7 +2,7 @@
 # 使用方法：将代码推送到 GitHub 后，在 Render 控制台选择 "New > Blueprint"
 # 关联仓库即可自动创建以下服务
 services:
-  - type: worker
+  - type: web
     name: okx-ea
     runtime: python
     # 构建阶段：安装依赖 + 给start.sh执行权限
