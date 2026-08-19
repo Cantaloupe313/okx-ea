@@ -2,11 +2,13 @@
 # 使用方法：将代码推送到 GitHub 后，在 Render 控制台选择 "New > Blueprint"
 # 关联仓库即可自动创建以下服务
 services:
-  - type: web
+  - type: worker
     name: okx-ea
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python okx-ea.py
+    # 构建阶段：安装依赖 + 给start.sh执行权限
+    buildCommand: "pip install -r requirements.txt && chmod +x start.sh"
+    # 启动：调用bash执行脚本，规避权限问题
+    startCommand: "bash ./start.sh -x demo -amount 10 -init-side buy"
     plan: free
     autoDeploy: true
     healthCheckPath: /health
@@ -52,4 +54,3 @@ services:
       # 海外服务器直连 OKX，必须留空禁用代理
       - key: PROXY_URL
         value: ""
-      
