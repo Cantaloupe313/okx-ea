@@ -934,7 +934,7 @@ def run_scheduler_blocking():
     scheduler = BlockingScheduler(timezone='Asia/Shanghai')
 
     # 核心策略：每 15 分钟检查一次（00分、15分、30分、45分）
-    job = scheduler.add_job(execute_strategy, 'cron', minute='0,15,30,45', second='0')
+    job = scheduler.add_job(execute_strategy, 'cron', minute='0,5,15,20,25,30,35,40,45,50,55', second='0')
 
     # 监控：每 30 秒检查一次，在持仓完全平仓后延迟清理未成交的反向委托
     scheduler.add_job(
@@ -992,7 +992,7 @@ if __name__ == "__main__":
         scheduler = BlockingScheduler(timezone='Asia/Shanghai')
 
         # 核心策略：每 15 分钟检查一次
-        scheduler.add_job(execute_strategy, 'cron', minute='0,15,30,45', second='0')
+        scheduler.add_job(execute_strategy, 'cron', minute='0,5,15,20,25,30,35,40,45,50,55', second='0')
 
         # 监控：每 30 秒检查一次，在持仓完全平仓后延迟清理未成交的反向委托
         scheduler.add_job(
