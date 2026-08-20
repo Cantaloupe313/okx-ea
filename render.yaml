@@ -51,6 +51,8 @@ services:
         sync: false
       - key: OKX_LIVE_PASSWORD
         sync: false
+      - key: AUTO_REVERSE_TRADE
+        sync: false
       # 海外服务器直连 OKX，必须留空禁用代理
       - key: PROXY_URL
         value: ""
