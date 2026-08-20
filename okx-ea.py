@@ -47,6 +47,7 @@ SL_USD = float(os.environ.get('SL_USD', '4.0'))      # 初始单止损 (ETH 美�
 REVERSE_TP_USD = TP_USD  # 反向单止盈价差（使用与初始单相同的TP_USD）
 REVERSE_SL_USD = SL_USD  # 反向单止损价差（使用与初始单相同的SL_USD）
 LOT_REVERSE_RATIO = float(os.environ.get('LOT_REVERSE_RATIO', '2.0'))  # 反向翻仓手数倍率
+AUTO_REVERSE_TRADE = os.environ.get('AUTO_REVERSE_TRADE', 'true').lower() == 'true'  # 自动反向交易开关（默认开启）
 
 last_order_time = 0
 last_order_id = None  # 记录最后下单的ID
@@ -57,6 +58,7 @@ target_net_profit = float(os.environ.get('TARGET_NETPROFIT', '0.0'))
 has_achieved_target = False
 has_reverse_order = False  # 标记是否已开反向单
 monitor_thread_running = True  # 控制监控线程的运行/停止
+current_trade_side = None  # 当前活跃的交易方向（'buy' 或 'sell'）
 
 
 def get_account_info():
@@ -635,7 +637,7 @@ def restore_state_from_exchange():
 
 
 def execute_strategy():
-    global last_order_time, has_achieved_target
+    global last_order_time, has_achieved_target, current_trade_side
 
     # 尝试从交易所恢复监控状态
     restore_state_from_exchange()
@@ -715,7 +717,74 @@ def execute_strategy():
     if check_has_active_trades():
         return
 
-    # 2. 获取最新价格并计算委托价格
+    # 2. 自动反向交易逻辑
+    if AUTO_REVERSE_TRADE:
+        # 获取当前活跃方向
+        current_side = None
+        positions = get_position_details()
+        open_orders = exchange.fetch_open_orders(SYMBOL)
+
+        # 检查是否有持仓
+        if positions['long'] > 0:
+            current_side = 'long'
+        elif positions['short'] > 0:
+            current_side = 'short'
+
+        # 检查是否有未成交委托
+        if current_side is None and len(open_orders) > 0:
+            # 如果有委托但没持仓，说明是反向单在等待触发
+            for order in open_orders:
+                if order.get('status') == 'open':
+                    # 检查是否是条件单（反向单）
+                    if order.get('info', {}).get('attachAlgoOrds') or order.get('info', {}).get('trigger'):
+                        current_side = 'pending_reverse'
+                        break
+
+        # 如果没有持仓也没有未成交委托，且开启了自动反向交易
+        if current_side is None and AUTO_REVERSE_TRADE:
+            print(f"\n  🔄 [自动反向交易] 检测到无活跃交易，准备开启新单...")
+
+            # 计算下一个初始方向：当前方向的反向
+            if current_trade_side == 'buy':
+                init_side = 'sell'
+            elif current_trade_side == 'sell':
+                init_side = 'buy'
+            else:
+                # 如果当前没有交易方向，使用环境变量默认方向
+                init_side = args.init_side
+
+            print(f"  🎯 新单方向: {init_side}（反向于当前方向 {current_trade_side or '无'}）")
+
+            # 获取最新价格并下单
+            try:
+                ticker = exchange.fetch_ticker(SYMBOL)
+                current_price = float(ticker['last'])
+
+                raw_price = current_price + 0.01 if init_side == 'sell' else current_price - 0.01
+                entry_price = float(exchange.price_to_precision(SYMBOL, raw_price))
+                amount = eth_to_contracts(AMOUNT_ETH)
+
+                # 设置止盈止损
+                tp_trigger = float(exchange.price_to_precision(SYMBOL, entry_price - TP_USD)) if init_side == 'sell' else float(exchange.price_to_precision(SYMBOL, entry_price + TP_USD))
+                sl_trigger = float(exchange.price_to_precision(SYMBOL, entry_price + SL_USD)) if init_side == 'sell' else float(exchange.price_to_precision(SYMBOL, entry_price - SL_USD))
+
+                print(f"  📊 下单参数：{init_side.upper()} | 价格: {entry_price} | 数量: {AMOUNT_ETH} ETH ({amount} 张)")
+                print(f"  🎯 止盈: {tp_trigger} (价差 {TP_USD} USD) | 止损: {sl_trigger} (价差 {SL_USD} USD)")
+
+                order = place_limit_order(init_side, entry_price, amount, tp_trigger, sl_trigger)
+
+                if order:
+                    current_trade_side = init_side  # 更新当前交易方向
+                    last_order_time = time.time()
+                    print("  ✅ 新单开仓成功！等待成交。")
+                    print(f"     [DEBUG] 新单设置 - 开仓价: {entry_price}, 止盈: {tp_trigger}, 止损: {sl_trigger}")
+                    return
+                else:
+                    print(f"  ⚠️ 新单开仓失败")
+            except Exception as e:
+                print(f"  ⚠️ 自动反向交易执行异常: {e}")
+
+    # 3. 获取最新价格并计算委托价格（备用逻辑，如果自动反向被禁用）
     try:
         ticker = exchange.fetch_ticker(SYMBOL)
         current_price = float(ticker['last'])
@@ -740,6 +809,7 @@ def execute_strategy():
             order = place_limit_order('buy', entry_price, amount, tp_trigger, sl_trigger)
 
             if order:
+                current_trade_side = 'buy'  # 更新当前交易方向
                 last_order_time = time.time()
                 print("  ✅ 初始开仓成功！等待成交。")
                 print(f"     [DEBUG] 初始单设置 - 开仓价: {entry_price}, 止盈: {tp_trigger}, 止损: {sl_trigger}")
@@ -759,6 +829,7 @@ def execute_strategy():
             order = place_limit_order('sell', entry_price, amount, tp_trigger, sl_trigger)
 
             if order:
+                current_trade_side = 'sell'  # 更新当前交易方向
                 last_order_time = time.time()
                 print("  ✅ 初始开仓成功！等待成交。")
                 print(f"     [DEBUG] 初始单设置 - 开仓价: {entry_price}, 止盈: {tp_trigger}, 止损: {sl_trigger}")
@@ -904,6 +975,8 @@ def create_web_app():
             'amount_eth': AMOUNT_ETH,
             'last_order_time': last_order_time,
             'has_reverse_order': has_reverse_order,
+            'auto_reverse_trade': AUTO_REVERSE_TRADE,
+            'current_trade_side': current_trade_side,
         })
 
     return app
@@ -955,6 +1028,7 @@ if __name__ == "__main__":
     print(f"  - 初始单：止盈 = {TP_USD} USD，止损 = {SL_USD} USD")
     print(f"  - 反向单：使用与初始单相同的止盈/止损价差")
     print(f"  - 翻仓倍数 = {LOT_REVERSE_RATIO}x")
+    print(f"  - 自动反向交易 = {'启用' if AUTO_REVERSE_TRADE else '禁用'}")
     print(f"目标净值 = {target_net_profit} USDT")
 
     # 设置交易模式

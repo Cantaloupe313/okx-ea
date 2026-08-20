@@ -3,7 +3,7 @@
 # 用法：
 #   ./start.sh -x demo              # 启动模拟盘（数量用 .env 中的 AMOUNT_ETH）
 #   ./start.sh -x live              # 启动实盘
-#   ./start.sh -x demo -amount 20   # 启动模拟盘，指定下单 20 ETH
+#   ./start.sh -x demo -amount 20 -init-side sell  # 启动模拟盘，指定下单 20 ETH
 
 source venv/bin/activate
 set -e
