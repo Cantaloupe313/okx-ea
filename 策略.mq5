@@ -1,6 +1,6 @@
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "2.4.9"
+#property version   "2.5.0"
 
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh>
@@ -30,6 +30,7 @@ input int    RepeatGuardMin     = 2;       // 防重复间隔(分钟)
 input int    CancelDelaySec     = 5;      // 延迟撤单秒数(防止平仓与挂单触发的并发冲突)
 input double TargetNetProfit    = 10050.0;  // 目标净值(达到后全部平仓并停止)
 input double MaxDrawdownPct     = 50.0;    // 最大回撤率(%)，达到后终止EA并清仓
+input bool   ReverseDirectionAfterSL = true; // 初始单止损平仓后，下一次方向是否反转
 
 //===== 隔夜库存费规避参数 =====
 input bool   AvoidSwapWednesdayOnly = false; // 是否仅在周三深夜规避库存费
@@ -45,6 +46,7 @@ datetime g_pending_cancel_time = 0;  // 计划执行撤单的时间 (0表示无�
 bool  g_target_reached = false;    // 目标净值是否已达成标志
 double g_max_drawdown = 0.0;        // 当前最大回撤(美元)
 bool  g_stop_on_drawdown = false;   // 是否因回撤停止标志
+ENUM_INIT_DIRECTION g_currentDirection = DIR_SHORT; // 当前执行方向（用于方向反转功能）
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -60,8 +62,11 @@ int OnInit()
    }
    
    g_nextTriggerTime = CalculateNextTriggerTime(TimeTradeServer());
-   
-   if(InitialDirection == DIR_SHORT)
+
+   // 初始化当前方向
+   g_currentDirection = InitialDirection;
+
+   if(g_currentDirection == DIR_SHORT)
       PrintFormat("EA启动，规则：定时自动做空 + 立即挂反向多单 | 目标净值: %.2f", TargetNetProfit);
    else
       PrintFormat("EA启动，规则：定时自动做多 + 立即挂反向空单 | 目标净值: %.2f", TargetNetProfit);
@@ -505,7 +510,15 @@ void MonitorPositionStatus()
    {
       // 属于【止损翻仓】情况：更新监控ID为新持仓的ID，不执行撤单流程
       PrintFormat("【监控通知】初始持仓止损离场，反向翻仓单已激活！新持仓ID: %I64u", newPositionID);
-      g_monitor_position_id = newPositionID; 
+      g_monitor_position_id = newPositionID;
+
+      // 更新当前方向：如果参数为true，则反转方向
+      if(ReverseDirectionAfterSL)
+      {
+         g_currentDirection = (g_currentDirection == DIR_SHORT) ? DIR_LONG : DIR_SHORT;
+         PrintFormat("【方向更新】已反转方向为: %s", (g_currentDirection == DIR_SHORT) ? "做空" : "做多");
+      }
+
       g_reverse_order_ticket = INVALID_ORDER_TICKET; // 挂单已成持仓，释放挂单Ticket
    }
    else
@@ -609,9 +622,9 @@ void OnTimer()
       return;
    }
    
-   // 执行开仓
-   if(InitialDirection == DIR_SHORT) ExecuteShortOrder();
-   else                              ExecuteLongOrder();
+   // 执行开仓（根据当前方向）
+   if(g_currentDirection == DIR_SHORT) ExecuteShortOrder();
+   else                                 ExecuteLongOrder();
       
    g_lastTradeTime = serverNow;
    g_nextTriggerTime = nextAfterThis;
