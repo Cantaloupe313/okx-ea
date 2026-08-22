@@ -1,6 +1,6 @@
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "2.5.0"
+#property version   "2.5.1"
 
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh>
@@ -24,22 +24,21 @@ input double LotShort           = 0.01;     // 初始做空手数
 input double LotLong            = 0.01;     // 初始做多手数
 input double LotLongReverse     = 0.02;     // 做空止损反向多单手数
 input double LotShortReverse    = 0.02;     // 做多止损反向空手数
-input double TP_USD             = 3;     // 止盈(美元，XAUUSD价格差)
-input double SL_USD             = 3;     // 止损(美元，XAUUSD价格差)
+input double TP_USD             = 18;     // 止盈(美元，XAUUSD价格差)
+input double SL_USD             = 18;     // 止损(美元，XAUUSD价格差)
 input int    RepeatGuardMin     = 2;       // 防重复间隔(分钟)
 input int    CancelDelaySec     = 5;      // 延迟撤单秒数(防止平仓与挂单触发的并发冲突)
-input double TargetNetProfit    = 10050.0;  // 目标净值(达到后全部平仓并停止)
+input double TargetNetProfit    = 150;  // 目标净值(达到后全部平仓并停止)
 input double MaxDrawdownPct     = 50.0;    // 最大回撤率(%)，达到后终止EA并清仓
 input bool   ReverseDirectionAfterSL = true; // 初始单止损平仓后，下一次方向是否反转
 
 //===== 隔夜库存费规避参数 =====
-input bool   AvoidSwapWednesdayOnly = false; // 是否仅在周三深夜规避库存费
-input int    AvoidSwapBeforeMin     = 10;   // 扣除库存费前停止时间(分钟)
-input int    AvoidSwapAfterMin      = 10;   // 扣除库存费后恢复时间(分钟)
+input int    AvoidSwapBeforeMin     = 45;   // 扣除库存费前检查并清理盈利仓位的时间(分钟)
 
 //===== 全局变量 =====
 datetime g_lastTradeTime = 0;        // 上次下单时间戳
 datetime g_nextTriggerTime = 0;      // 下次定时触发时间
+datetime g_swap_check_time = 0;      // 下次库存费检查时间
 ulong g_monitor_position_id = INVALID_POSITION_ID; // 待监控的持仓唯一ID
 ulong g_reverse_order_ticket = INVALID_ORDER_TICKET; // 关联的反向翻仓挂单Ticket
 datetime g_pending_cancel_time = 0;  // 计划执行撤单的时间 (0表示无计划)
@@ -62,14 +61,15 @@ int OnInit()
    }
    
    g_nextTriggerTime = CalculateNextTriggerTime(TimeTradeServer());
+   g_swap_check_time = 0; // 0表示未初始化，会在第一次调用时计算
 
    // 初始化当前方向
    g_currentDirection = InitialDirection;
 
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动，规则：定时自动做空 + 立即挂反向多单 | 目标净值: %.2f", TargetNetProfit);
+      PrintFormat("EA启动，规则：定时自动做空 + 立即挂反向多单 | 目标净值: %.2f | 库存费前清理: %d 分钟", TargetNetProfit, AvoidSwapBeforeMin);
    else
-      PrintFormat("EA启动，规则：定时自动做多 + 立即挂反向空单 | 目标净值: %.2f", TargetNetProfit);
+      PrintFormat("EA启动，规则：定时自动做多 + 立即挂反向空单 | 目标净值: %.2f | 库存费前清理: %d 分钟", TargetNetProfit, AvoidSwapBeforeMin);
    
    return INIT_SUCCEEDED;
 }
@@ -533,30 +533,178 @@ void MonitorPositionStatus()
 }
 
 //+------------------------------------------------------------------+
-//| 检查是否处于库存费避让窗口                                         |
+//| 判断当前是否在库存费规避时间段（周三23:00-周四00:00，周四00:00-周五00:00）|
 //+------------------------------------------------------------------+
-bool IsInSwapAvoidWindow(datetime serverTime)
+bool IsInSwapAvoidWindow(datetime checkTime)
 {
    MqlDateTime dt;
-   TimeToStruct(serverTime, dt);
-   
-   if(AvoidSwapWednesdayOnly)
+   TimeToStruct(checkTime, dt);
+
+   bool isWednesdayOrThursday = (dt.day_of_week == 3 || dt.day_of_week == 4);
+
+   // 周三23:00-周四00:00（包含边界）
+   if(isWednesdayOrThursday && dt.hour == 23)
+      return true;
+
+   // 周四00:00-周五00:00（包含边界）
+   if(dt.day_of_week == 4 && dt.hour == 0)
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| 计算下一个库存费扣除时间点                                          |
+//+------------------------------------------------------------------+
+datetime CalculateNextSwapTime(datetime fromTime)
+{
+   MqlDateTime dt;
+   TimeToStruct(fromTime, dt);
+
+   // 检查是否在23:00（周三/周四）或00:00（周四/周五）
+   // 库存费扣除通常发生在这些时间点之前几分钟
+
+   int nextMin = 0;
+   bool isWednesdayOrThursday = (dt.day_of_week == 3 || dt.day_of_week == 4);
+
+   if(isWednesdayOrThursday && dt.hour == 23)
    {
-      if(dt.day_of_week == 3) // 周三
-      {
-         if(dt.hour == 23 && dt.min >= (60 - AvoidSwapBeforeMin)) return true;
-      }
-      else if(dt.day_of_week == 4) // 周四
-      {
-         if(dt.hour == 0 && dt.min < AvoidSwapAfterMin) return true;
-      }
-      return false;
+      // 周三/周四 23:xx，下一个是00:00
+      nextMin = 60 - dt.min;
+      dt.min = 0;
+   }
+   else if(dt.hour == 0 && dt.min < 10 && isWednesdayOrThursday)
+   {
+      // 周四/周五 00:xx，下一个是23:00
+      nextMin = 60 - dt.min;
+      dt.min = 0;
+      dt.hour = 23;
+      dt.day_of_week++; // 周四 -> 周五
+      if(dt.day_of_week == 7) dt.day_of_week = 0;
    }
    else
    {
-      if(dt.hour == 23 && dt.min >= (60 - AvoidSwapBeforeMin)) return true;
-      if(dt.hour == 0  && dt.min < AvoidSwapAfterMin) return true;
-      return false;
+      // 其他时间，下一个23:00
+      nextMin = 60 - dt.min;
+      dt.min = 0;
+   }
+
+   dt.hour += nextMin / 60;
+   dt.sec = 0;
+
+   datetime candidate = StructToTime(dt);
+
+   // 确保返回的时间在未来
+   while(candidate <= fromTime)
+   {
+      candidate += 3600; // 至少1小时后
+   }
+
+   return candidate;
+}
+
+//+------------------------------------------------------------------+
+//| 检查并清理盈利仓位（库存费前清理）                                   |
+//+------------------------------------------------------------------+
+void CheckAndCleanProfitablePositions()
+{
+   // 计算距离下次库存费扣除的时间
+   datetime swapCheckTime = CalculateNextSwapTime(TimeTradeServer());
+   long minutesUntilSwap = (swapCheckTime - TimeTradeServer()) / 60;
+
+   // 如果距离下次库存费扣除时间少于 AvoidSwapBeforeMin 分钟，则执行清理
+   if(minutesUntilSwap < AvoidSwapBeforeMin)
+   {
+      bool hasProfitablePosition = false;
+
+      // 遍历所有持仓，检查是否有盈利的
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong posTicket = PositionGetTicket(i);
+         if(posTicket == 0) continue;
+
+         if(PositionSelectByTicket(posTicket))
+         {
+            if(IsSameBaseSymbol(PositionGetString(POSITION_SYMBOL), _Symbol) &&
+               PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+            {
+               double profit = PositionGetDouble(POSITION_PROFIT);
+
+               // 修改：盈利必须大于5 USD才清理，亏损仓位不处理
+               if(profit > 5.0)
+               {
+                  hasProfitablePosition = true;
+                  PrintFormat("【库存费清理】检测到盈利仓位 Ticket:%I64u, 盈利: %.2f USD，将提前平仓", posTicket, profit);
+                  break;
+               }
+            }
+         }
+      }
+
+      // 如果有盈利仓位，执行清理
+      if(hasProfitablePosition)
+      {
+         PrintFormat("【库存费清理】开始清理盈利仓位和未成交委托，距离库存费扣除还有 %d 分钟", (int)minutesUntilSwap);
+
+         // 平仓所有持仓
+         int closedCount = 0;
+         for(int i = PositionsTotal() - 1; i >= 0; i--)
+         {
+            ulong posTicket = PositionGetTicket(i);
+            if(posTicket == 0) continue;
+
+            if(PositionSelectByTicket(posTicket))
+            {
+               if(IsSameBaseSymbol(PositionGetString(POSITION_SYMBOL), _Symbol) &&
+                  PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+               {
+                  if(trade.PositionClose(posTicket))
+                  {
+                     closedCount++;
+                     PrintFormat("  已平仓 Ticket:%I64u", posTicket);
+                  }
+                  Sleep(200);
+               }
+            }
+         }
+
+         // 撤销所有未成交委托
+         int deletedCount = 0;
+         for(int i = OrdersTotal() - 1; i >= 0; i--)
+         {
+            ulong orderTicket = OrderGetTicket(i);
+            if(orderTicket == 0) continue;
+
+            if(OrderSelect(orderTicket))
+            {
+               if(IsSameBaseSymbol(OrderGetString(ORDER_SYMBOL), _Symbol) &&
+                  OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+               {
+                  if(trade.OrderDelete(orderTicket))
+                  {
+                     deletedCount++;
+                     PrintFormat("  已撤销挂单 Ticket:%I64u", orderTicket);
+                  }
+                  Sleep(200);
+               }
+            }
+         }
+
+         PrintFormat("【库存费清理】完成！已平仓 %d 个仓位，已撤销 %d 个委托", closedCount, deletedCount);
+
+         // 更新下次检查时间，避免短时间内重复执行
+         g_swap_check_time = TimeTradeServer() + 60;
+      }
+      else
+      {
+         // 没有盈利仓位，更新检查时间
+         g_swap_check_time = swapCheckTime;
+      }
+   }
+   else
+   {
+      // 距离下次库存费扣除时间较远，更新下次检查时间
+      g_swap_check_time = swapCheckTime;
    }
 }
 
@@ -573,17 +721,28 @@ void OnTimer()
    // ===== 核心逻辑优化：生命周期监控与目标净值检查不受避让窗影响 =====
    if(g_target_reached) return;
 
+   // 0. 检查并清理库存费前的盈利仓位
+   if(g_swap_check_time == 0 || serverNow >= g_swap_check_time)
+   {
+      CheckAndCleanProfitablePositions();
+   }
+
    // 1. 优先执行基础系统检查与持仓监控（即使在Swap避让期也要跑，否则止盈单在避让期内成交将无法撤单）
    CheckAndCloseAllPositions();
    if(g_target_reached) return;
 
    MonitorPositionStatus();
 
-   // 2. 检查是否处于库存费规避时间段（只限制开仓动作）
-   if(IsInSwapAvoidWindow(serverNow))
+   // 2. 检查是否在面板配置时间和实际扣库存费时间点之间（不新开仓）
+   datetime swapExecutionTime = CalculateNextSwapTime(serverNow);
+   long minutesUntilSwap = (swapExecutionTime - serverNow) / 60;
+
+   if(minutesUntilSwap < AvoidSwapBeforeMin)
    {
-      // 处于避让期时，更新下一次定时开仓的时间，并退出开仓流
-      g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
+      // 距离扣库存费时间少于 AvoidSwapBeforeMin 分钟，进入避让期
+      PrintFormat("【库存费避让】距离扣库存费还有 %d 分钟，避让期内不新开仓。扣费时间: %s",
+                  (int)minutesUntilSwap,
+                  TimeToString(swapExecutionTime, TIME_DATE|TIME_MINUTES));
       return;
    }
 
@@ -595,37 +754,37 @@ void OnTimer()
       g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
       return;
    }
-   
+
    // 4. 定时开仓触发控制
    if(serverNow < g_nextTriggerTime) return;
-   
+
    if(serverNow - g_nextTriggerTime > 5)
    {
       g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
       return;
    }
-   
+
    datetime nextAfterThis = CalculateNextTriggerTime(serverNow);
-   
+
    if(serverNow - g_lastTradeTime < RepeatGuardMin * 60)
    {
       g_nextTriggerTime = nextAfterThis;
       return;
    }
-   
+
    if(CheckHasAnyPendingOrder() || CheckHasAnyPosition())
    {
-      PrintFormat("【定时任务】时间: %s，存在未成交委托或已成交仓位，跳过本次执行。下次触发: %s", 
-                  TimeToString(serverNow, TIME_DATE|TIME_MINUTES), 
+      PrintFormat("【定时任务】时间: %s，存在未成交委托或已成交仓位，跳过本次执行。下次触发: %s",
+                  TimeToString(serverNow, TIME_DATE|TIME_MINUTES),
                   TimeToString(nextAfterThis, TIME_DATE|TIME_MINUTES));
       g_nextTriggerTime = nextAfterThis;
       return;
    }
-   
+
    // 执行开仓（根据当前方向）
    if(g_currentDirection == DIR_SHORT) ExecuteShortOrder();
    else                                 ExecuteLongOrder();
-      
+
    g_lastTradeTime = serverNow;
    g_nextTriggerTime = nextAfterThis;
 }
