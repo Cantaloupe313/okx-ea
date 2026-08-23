@@ -1,6 +1,6 @@
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "4.0.0"
+#property version   "3.0.0"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh>
 CTrade trade;
