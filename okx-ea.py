@@ -359,11 +359,20 @@ def place_limit_order(side, price, amount, tp_trigger=None, sl_trigger=None):
     # 附带止盈止损
     if tp_trigger is not None or sl_trigger is not None:
         algo = {}
-        if sl_trigger is not None:
+
+        # OKX API 要求：条件单的止损触发价必须根据方向调整符号
+        # 买单：slTriggerPx 必须 < 主订单价格，tpTriggerPx 必须 > 主订单价格
+        # 卖单：slTriggerPx 必须 > 主订单价格，tpTriggerPx 必须 < 主订单价格
+        if side == 'buy':
+            # 买单：止损价 < 开仓价，止盈价 > 开仓价
             algo['slTriggerPx'] = str(round(sl_trigger, 2))
             algo['slOrdPx'] = str(round(sl_trigger, 2))
-
-        if tp_trigger is not None:
+            algo['tpTriggerPx'] = str(round(tp_trigger, 2))
+            algo['tpOrdPx'] = str(round(tp_trigger, 2))
+        else:  # sell
+            # 卖单：止损价 > 开仓价，止盈价 < 开仓价
+            algo['slTriggerPx'] = str(round(sl_trigger, 2))
+            algo['slOrdPx'] = str(round(sl_trigger, 2))
             algo['tpTriggerPx'] = str(round(tp_trigger, 2))
             algo['tpOrdPx'] = str(round(tp_trigger, 2))
 
@@ -491,10 +500,15 @@ def monitor_initial_order_filled():
             # 反向单开仓价等于初始单止损价
             reverse_price = sl_trigger
 
-            # 反向单止盈价：反向开仓价 + TP_USD
-            # 反向单止损价：反向开仓价 - SL_USD
-            reverse_tp = round(reverse_price + TP_USD, 2)
-            reverse_sl = round(reverse_price - REVERSE_SL_USD, 2)
+            # 反向单止盈止损：根据方向调整符号
+            # 买单：止盈价 = 开仓价 + TP_USD，止损价 = 开仓价 - SL_USD
+            # 卖单：止盈价 = 开仓价 - TP_USD，止损价 = 开仓价 + SL_USD
+            if reverse_side == 'buy':
+                reverse_tp = round(reverse_price + TP_USD, 2)
+                reverse_sl = round(reverse_price - SL_USD, 2)
+            else:  # sell
+                reverse_tp = round(reverse_price - TP_USD, 2)
+                reverse_sl = round(reverse_price + SL_USD, 2)
 
             print(f"     反向方向: {reverse_side}")
             print(f"     反向数量: {AMOUNT_ETH * LOT_REVERSE_RATIO} ETH ({reverse_amount} 张)")
@@ -765,6 +779,8 @@ def execute_strategy():
                 amount = eth_to_contracts(AMOUNT_ETH)
 
                 # 设置止盈止损
+                # 买单：止盈价 = 开仓价 + TP_USD，止损价 = 开仓价 - SL_USD
+                # 卖单：止盈价 = 开仓价 - TP_USD，止损价 = 开仓价 + SL_USD
                 tp_trigger = float(exchange.price_to_precision(SYMBOL, entry_price - TP_USD)) if init_side == 'sell' else float(exchange.price_to_precision(SYMBOL, entry_price + TP_USD))
                 sl_trigger = float(exchange.price_to_precision(SYMBOL, entry_price + SL_USD)) if init_side == 'sell' else float(exchange.price_to_precision(SYMBOL, entry_price - SL_USD))
 
@@ -800,6 +816,7 @@ def execute_strategy():
             amount = eth_to_contracts(AMOUNT_ETH)
 
             # 设置止盈止损
+            # 买单：止盈价 = 开仓价 + TP_USD，止损价 = 开仓价 - SL_USD
             tp_trigger = float(exchange.price_to_precision(SYMBOL, entry_price + TP_USD))
             sl_trigger = float(exchange.price_to_precision(SYMBOL, entry_price - SL_USD))
 
@@ -819,7 +836,7 @@ def execute_strategy():
             entry_price = float(exchange.price_to_precision(SYMBOL, raw_price))
             amount = eth_to_contracts(AMOUNT_ETH)
 
-            # 设置止盈止损
+            # 卖单：止盈价 = 开仓价 - TP_USD，止损价 = 开仓价 + SL_USD
             tp_trigger = float(exchange.price_to_precision(SYMBOL, entry_price - TP_USD))
             sl_trigger = float(exchange.price_to_precision(SYMBOL, entry_price + SL_USD))
 
