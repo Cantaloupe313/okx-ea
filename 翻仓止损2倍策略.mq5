@@ -27,8 +27,8 @@ input double LotLongReverse     = 0.02;     // 做空止损反向多单手数
 input double LotShortReverse    = 0.02;     // 做多止损反向空手数
 input double TP_USD             = 18;        // 止盈(美元，XAUUSD价格差)
 input double SL_USD             = 18;        // 止损(美元，XAUUSD价格差)
-input double SL_RATIO           = 2;         // 翻仓单止损倍率，默认2
-input double TP_RATIO           = 1;        // 翻仓单止盈倍率，默认1
+input double REV_SL_USD          = 36;         // 翻仓单止损价差，默认36
+input double REV_TP_USD          = 18;        // 翻仓单止盈价差，默认18
 input int    IntervalMinutes    = 5;        // 开仓间隔(分钟) 每小时每隔多长时间开仓（默认5）
 input int    RepeatGuardMin     = 2;        // 防重复间隔(分钟)
 input int    CancelDelaySec     = 5;        // 延迟撤单秒数(防止平仓与挂单触发的并发冲突)
@@ -448,9 +448,9 @@ void ExecuteShortOrder()
       ulong deal_ticket = trade.ResultDeal();
       g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ? 
                               HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID();
-      double rev_tp = NormalizeDouble(sl_price + TP_USD * TP_RATIO, _Digits);
+      double rev_tp = NormalizeDouble(sl_price + REV_TP_USD, _Digits);
       // ==========修改点：反向翻仓单止损扩大2倍 SL_USD*2 ==========
-      double rev_sl = NormalizeDouble(sl_price - SL_USD * SL_RATIO, _Digits);
+      double rev_sl = NormalizeDouble(sl_price - REV_SL_USD, _Digits);
       if(trade.BuyStop(LotLongReverse, sl_price, _Symbol, rev_sl, rev_tp, ORDER_TIME_GTC, 0, "Reverse BuyStop"))
          g_reverse_order_ticket = trade.ResultOrder();
          
@@ -492,9 +492,9 @@ void ExecuteLongOrder()
       ulong deal_ticket = trade.ResultDeal();
       g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ? 
                               HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID();
-      double rev_tp = NormalizeDouble(sl_price - TP_USD, _Digits);
+      double rev_tp = NormalizeDouble(sl_price - REV_TP_USD, _Digits);
       // ==========修改点：反向翻仓单止损扩大2倍 SL_USD*2 ==========
-      double rev_sl = NormalizeDouble(sl_price + SL_USD * 2.0, _Digits);
+      double rev_sl = NormalizeDouble(sl_price + REV_SL_USD, _Digits);
       if(trade.SellStop(LotShortReverse, sl_price, _Symbol, rev_sl, rev_tp, ORDER_TIME_GTC, 0, "Reverse SellStop"))
          g_reverse_order_ticket = trade.ResultOrder();
       
