@@ -472,7 +472,7 @@ void ExecuteShortOrder()
    const double virtual_tp = NormalizeDouble(bid - TP_USD, _Digits);
    
    // ★★★ 关键：SL=0, TP=0 ★★★
-   if(trade.Sell(LotShort, _Symbol, bid, 0, 0, "Init Short"))
+   if(trade.Sell(LotShort, _Symbol, bid, 0, 0, ""))
    {
       ulong deal_ticket = trade.ResultDeal();
       g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ? 
@@ -487,7 +487,7 @@ void ExecuteShortOrder()
       double rev_sl = NormalizeDouble(virtual_sl - REV_SL_USD, _Digits);
       
       // ★★★ 反向挂单同样不设 SL/TP ★★★
-      if(trade.BuyStop(LotLongReverse, virtual_sl, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Reverse BuyStop"))
+      if(trade.BuyStop(LotLongReverse, virtual_sl, _Symbol, 0, 0, ORDER_TIME_GTC, 0, ""))
          g_reverse_order_ticket = trade.ResultOrder();
          
       g_monitoring_reverse_position = false;
@@ -532,7 +532,7 @@ void ExecuteLongOrder()
    const double virtual_tp = NormalizeDouble(ask + TP_USD, _Digits);
    
    // ★★★ 关键：SL=0, TP=0 ★★★
-   if(trade.Buy(LotLong, _Symbol, ask, 0, 0, "Init Long"))
+   if(trade.Buy(LotLong, _Symbol, ask, 0, 0, ""))
    {
       ulong deal_ticket = trade.ResultDeal();
       g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ? 
@@ -545,7 +545,7 @@ void ExecuteLongOrder()
       double rev_sl = NormalizeDouble(virtual_sl + REV_SL_USD, _Digits);
       
       // ★★★ 反向挂单同样不设 SL/TP ★★★
-      if(trade.SellStop(LotShortReverse, virtual_sl, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Reverse SellStop"))
+      if(trade.SellStop(LotShortReverse, virtual_sl, _Symbol, 0, 0, ORDER_TIME_GTC, 0, ""))
          g_reverse_order_ticket = trade.ResultOrder();
       
       g_monitoring_reverse_position = false;
