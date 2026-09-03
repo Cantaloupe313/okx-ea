@@ -5,22 +5,19 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "2.1.0"
+#property version   "2.1.3"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh>
 CTrade trade;
-
 //===== 兼容常量定义 =====
 #define INVALID_POSITION_ID 0
 #define INVALID_ORDER_TICKET 0
-
 //===== 初始方向枚举 =====
 enum ENUM_INIT_DIRECTION
 {
    DIR_SHORT = 0,  // 初始做空
    DIR_LONG  = 1   // 初始做多
 };
-
 //===== 外部参数 =====
 input ulong   InpMagicNumber     = 888151;  // EA魔术码(用于区分订单)
 input ENUM_INIT_DIRECTION InitialDirection = DIR_SHORT; // 初始方向
@@ -38,13 +35,11 @@ input int    CancelDelaySec     = 5;        // 延迟撤单秒数
 input double TargetNetProfit    = 10050.0;  // 目标净值(达到后全部平仓并停止)
 input double MaxDrawdownPct     = 50.0;     // 最大回撤率(%)，达到后终止EA并清仓
 input bool   ReverseDirectionAfterSL = true; // 初始单止损 + 反向单止盈后，是否反转方向
-
 //===== 隔夜库存费规避参数 =====
 input bool   AvoidSwapWednesdayOnly = false; // 是否仅在周三深夜规避库存费
 input int    AvoidSwapBeforeMin     = 10;    // 距离扣除库存费前多少分钟开始扫描
 input int    AvoidSwapAfterMin      = 10;    // 扣除库存费后恢复时间(分钟)
 input bool   EnableWeekendTrading   = false; // 是否开启周末定时开仓
-
 //===== 全局变量 =====
 datetime g_lastTradeTime = 0;
 datetime g_nextTriggerTime = 0;
@@ -59,11 +54,10 @@ bool     g_monitoring_reverse_position = false;
 datetime g_pending_reverse_check_time = 0;
 double   g_reverse_tp_price = 0.0;
 double   g_reverse_sl_price = 0.0;
-
 //===== 虚拟止损/止盈（本地记录）=====
 double   g_virtual_sl_price = 0.0;
 double   g_virtual_tp_price = 0.0;
-
+bool     g_last_close_was_tp = false;   // 新增：最近一次平仓是否为止盈（虚拟平仓专用）
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
@@ -75,18 +69,14 @@ int OnInit()
       Print("定时器创建失败！错误码：", GetLastError());
       return INIT_PARAMETERS_INCORRECT;
    }
-
    g_nextTriggerTime = CalculateNextTriggerTime(TimeTradeServer());
    g_currentDirection = InitialDirection;
-
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v2.1.0【虚拟止损加固版】规则：定时自动做空 + 立即挂反向多单 | 间隔:%d分钟 | 目标净值:%.2f", IntervalMinutes, TargetNetProfit);
+      PrintFormat("EA启动 v2.1.5【止盈后延迟撤单加固版】规则：定时自动做空 + 立即挂反向多单 | 间隔:%d分钟 | 目标净值:%.2f", IntervalMinutes, TargetNetProfit);
    else
-      PrintFormat("EA启动 v2.1.0【虚拟止损加固版】规则：定时自动做多 + 立即挂反向空单 | 间隔:%d分钟 | 目标净值:%.2f", IntervalMinutes, TargetNetProfit);
-
+      PrintFormat("EA启动 v2.1.5【止盈后延迟撤单加固版】规则：定时自动做多 + 立即挂反向空单 | 间隔:%d分钟 | 目标净值:%.2f", IntervalMinutes, TargetNetProfit);
    return INIT_SUCCEEDED;
 }
-
 //+------------------------------------------------------------------+
 //| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
@@ -94,7 +84,6 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
 }
-
 //+------------------------------------------------------------------+
 //| 辅助函数：提取商品的基础名称                                       |
 //+------------------------------------------------------------------+
@@ -106,12 +95,10 @@ string GetBaseSymbol(string fullSymbol)
    if(StringLen(fullSymbol) > 6) return StringSubstr(fullSymbol, 0, 6);
    return fullSymbol;
 }
-
 bool IsSameBaseSymbol(string symbolA, string symbolB)
 {
    return (GetBaseSymbol(symbolA) == GetBaseSymbol(symbolB));
 }
-
 //+------------------------------------------------------------------+
 //| 获取当前魔术码最新的持仓 ID                                        |
 //+------------------------------------------------------------------+
@@ -131,7 +118,6 @@ ulong GetLatestPositionID()
    }
    return INVALID_POSITION_ID;
 }
-
 //+------------------------------------------------------------------+
 //| 计算下一个触发点                                                   |
 //+------------------------------------------------------------------+
@@ -139,19 +125,14 @@ datetime CalculateNextTriggerTime(datetime fromTime)
 {
    MqlDateTime dt;
    TimeToStruct(fromTime, dt);
-
    int interval = IntervalMinutes;
    if(interval < 1) interval = 1;
-
    int nextMin = ((dt.min / interval) + 1) * interval;
-
    MqlDateTime nextDt = dt;
    nextDt.min = nextMin % 60;
    nextDt.hour += nextMin / 60;
    nextDt.sec = 0;
-
    datetime candidate = StructToTime(nextDt);
-
    while(candidate <= fromTime ||
          (!EnableWeekendTrading && (dt.day_of_week == 0 || dt.day_of_week == 6)))
    {
@@ -159,12 +140,10 @@ datetime CalculateNextTriggerTime(datetime fromTime)
          candidate += interval * 60;
       else
          candidate += 3600;
-
       TimeToStruct(candidate, dt);
    }
    return candidate;
 }
-
 //===== 防重复校验 =====
 bool CheckHasAnyPendingOrder()
 {
@@ -184,7 +163,6 @@ bool CheckHasAnyPendingOrder()
    }
    return false;
 }
-
 bool CheckHasAnyPosition()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -203,7 +181,6 @@ bool CheckHasAnyPosition()
    }
    return false;
 }
-
 void SetTradeFillingMode()
 {
    long filling = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
@@ -211,14 +188,12 @@ void SetTradeFillingMode()
    else if((filling & ORDER_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
    else                                        trade.SetTypeFilling(ORDER_FILLING_RETURN);
 }
-
 //+------------------------------------------------------------------+
 //| 回撤止损：停止EA并清仓                                             |
 //+------------------------------------------------------------------+
 void StopEAAndClean()
 {
    PrintFormat("【回撤保护】回撤率已达到阈值 %.2f%%，终止EA并清理仓位！", MaxDrawdownPct);
-
    int closedCount = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -234,7 +209,6 @@ void StopEAAndClean()
          }
       }
    }
-
    int deletedCount = 0;
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
@@ -252,7 +226,6 @@ void StopEAAndClean()
    }
    PrintFormat("【回撤保护】已平仓 %d 个仓位，已撤销 %d 个委托。EA已停止运行。", closedCount, deletedCount);
 }
-
 //+------------------------------------------------------------------+
 //| 计算并检查最大回撤                                                 |
 //+------------------------------------------------------------------+
@@ -260,23 +233,18 @@ void CalculateMaxDrawdown()
 {
    double currentEquity = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_PROFIT);
    static double highestEquity = 0.0;
-
    if(g_max_drawdown == 0.0 && highestEquity == 0.0)
    {
       highestEquity = currentEquity;
       g_max_drawdown = 0.0;
       return;
    }
-
    double drawdownPct = 0.0;
    if(highestEquity > 0.0)
       drawdownPct = ((highestEquity - currentEquity) / highestEquity) * 100.0;
-
    g_max_drawdown = highestEquity - currentEquity;
-
    if(currentEquity > highestEquity)
       highestEquity = currentEquity;
-
    if(drawdownPct >= MaxDrawdownPct && !g_stop_on_drawdown)
    {
       PrintFormat("【回撤保护】检测到回撤率 %.2f%%，达到阈值 %.2f%%，立即停止EA并清仓！", drawdownPct, MaxDrawdownPct);
@@ -284,7 +252,6 @@ void CalculateMaxDrawdown()
       StopEAAndClean();
    }
 }
-
 //+------------------------------------------------------------------+
 //| 检查目标净值                                                       |
 //+------------------------------------------------------------------+
@@ -292,7 +259,6 @@ void CheckAndCloseAllPositions()
 {
    CalculateMaxDrawdown();
    if(g_stop_on_drawdown) return;
-
    if(AccountInfoDouble(ACCOUNT_EQUITY) >= TargetNetProfit)
    {
       Print("【目标净值达成】正在全面清仓与撤单...");
@@ -307,7 +273,6 @@ void CheckAndCloseAllPositions()
          }
       }
       Sleep(500);
-
       for(int i = OrdersTotal() - 1; i >= 0; i--)
       {
          ulong orderTicket = OrderGetTicket(i);
@@ -321,49 +286,73 @@ void CheckAndCloseAllPositions()
       g_target_reached = true;
    }
 }
-
 //+------------------------------------------------------------------+
-//| 安全撤销关联的反向挂单                                             |
+//| 安全撤销关联的反向挂单（增强版：支持ticket丢失时全量扫描清理）      |
 //+------------------------------------------------------------------+
 void CancelAssociatedPendingOrder()
 {
-   if(g_reverse_order_ticket == INVALID_ORDER_TICKET) return;
-
-   if(OrderSelect(g_reverse_order_ticket))
+   // 1. 优先按记录的ticket撤销
+   if(g_reverse_order_ticket != INVALID_ORDER_TICKET)
    {
-      long orderState = OrderGetInteger(ORDER_STATE);
-      if(orderState == ORDER_STATE_PLACED)
+      if(OrderSelect(g_reverse_order_ticket))
       {
-         if(trade.OrderDelete(g_reverse_order_ticket))
-            PrintFormat("【撤单成功】初始单已平仓(止盈)，成功撤销关联未成交翻仓单，Ticket：%I64u", g_reverse_order_ticket);
+         long orderState = OrderGetInteger(ORDER_STATE);
+         if(orderState == ORDER_STATE_PLACED)
+         {
+            if(trade.OrderDelete(g_reverse_order_ticket))
+               PrintFormat("【撤单成功】初始单已平仓(止盈)，成功撤销关联未成交翻仓单，Ticket：%I64u", g_reverse_order_ticket);
+            else
+               PrintFormat("【撤单失败】尝试撤销挂单失败，Ticket：%I64u，错误码：%d", g_reverse_order_ticket, trade.ResultRetcode());
+         }
          else
-            PrintFormat("【撤单失败】尝试撤销挂单失败，Ticket：%I64u，错误码：%d", g_reverse_order_ticket, trade.ResultRetcode());
+            PrintFormat("【撤单跳过】反向挂单 Ticket:%I64u 状态已改变(%d)，极可能已被触发。", g_reverse_order_ticket, orderState);
       }
       else
-         PrintFormat("【撤单跳过】反向挂单 Ticket:%I64u 状态已改变(%d)，极可能已被触发。", g_reverse_order_ticket, orderState);
+      {
+         PrintFormat("【撤单通知】未找到挂单Ticket：%I64u，可能已被激活或手动删除。", g_reverse_order_ticket);
+      }
+      g_reverse_order_ticket = INVALID_ORDER_TICKET;
    }
-   else
+   // 2. 安全网：无论ticket是否有效，扫描并强制清理本EA所有残留挂单（防止变量丢失导致挂单残留）
+   int extraDeleted = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
-      PrintFormat("【撤单通知】未找到挂单Ticket：%I64u，可能已被激活或手动删除。", g_reverse_order_ticket);
+      ulong orderTicket = OrderGetTicket(i);
+      if(orderTicket == 0) continue;
+      if(OrderSelect(orderTicket))
+      {
+         if(IsSameBaseSymbol(OrderGetString(ORDER_SYMBOL), _Symbol) &&
+            OrderGetInteger(ORDER_MAGIC) == InpMagicNumber &&
+            OrderGetInteger(ORDER_STATE) == ORDER_STATE_PLACED)
+         {
+            if(trade.OrderDelete(orderTicket))
+            {
+               extraDeleted++;
+               PrintFormat("【安全撤单】额外清理残留挂单 Ticket:%I64u", orderTicket);
+               Sleep(100);
+            }
+            else
+            {
+               PrintFormat("【安全撤单失败】Ticket:%I64u 错误码:%d", orderTicket, trade.ResultRetcode());
+            }
+         }
+      }
    }
-
-   g_reverse_order_ticket = INVALID_ORDER_TICKET;
+   if(extraDeleted > 0)
+      PrintFormat("【安全撤单】共额外清理 %d 个残留挂单", extraDeleted);
 }
-
 //+------------------------------------------------------------------+
 //| 判断指定持仓是否以止盈方式平仓                                     |
 //+------------------------------------------------------------------+
 bool IsPositionClosedByTP(ulong position_id)
 {
    if(position_id == INVALID_POSITION_ID) return false;
-
    double expectedTP = g_monitoring_reverse_position ? g_reverse_tp_price : g_virtual_tp_price;
    if(expectedTP <= 0.0)
    {
       PrintFormat("【平仓判定】PositionID:%I64u 虚拟止盈价无效，无法判断", position_id);
       return false;
    }
-
    for(int retry = 0; retry < 8; retry++)
    {
       if(!HistorySelectByPosition(position_id))
@@ -371,113 +360,90 @@ bool IsPositionClosedByTP(ulong position_id)
          if(retry < 7) Sleep(100 + retry * 50);
          continue;
       }
-
       int total = HistoryDealsTotal();
       double closePrice = 0.0;
       double profit     = 0.0;
       long   reason     = -1;
       bool   foundOut   = false;
-
       for(int i = total - 1; i >= 0; i--)
       {
          ulong deal = HistoryDealGetTicket(i);
          if(deal == 0) continue;
-
          long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
          if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY) continue;
-
          foundOut   = true;
          closePrice = HistoryDealGetDouble(deal, DEAL_PRICE);
          profit     = HistoryDealGetDouble(deal, DEAL_PROFIT);
          reason     = HistoryDealGetInteger(deal, DEAL_REASON);
          break;
       }
-
       if(foundOut)
       {
          double tolerance = MathMax(_Point * 30, SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE) * 15);
-
          if(MathAbs(closePrice - expectedTP) <= tolerance)
          {
             PrintFormat("【平仓判定】PositionID:%I64u 平仓价:%.5f 接近虚拟TP:%.5f → 判定为止盈",
                         position_id, closePrice, expectedTP);
             return true;
          }
-
          if(reason == DEAL_REASON_TP)
          {
             PrintFormat("【平仓判定】PositionID:%I64u DEAL_REASON_TP → 止盈", position_id);
             return true;
          }
-
          if(reason == DEAL_REASON_SL)
          {
             PrintFormat("【平仓判定】PositionID:%I64u DEAL_REASON_SL → 止损", position_id);
             return false;
          }
-
          double lot = 0.0;
          if(HistoryDealSelect(HistoryDealGetTicket(total - 1)))
             lot = HistoryDealGetDouble(HistoryDealGetTicket(total - 1), DEAL_VOLUME);
          if(lot <= 0.0) lot = LotLongReverse;
-
          double threshold = MathMax(3.0, (g_monitoring_reverse_position ? REV_TP_USD : TP_USD) * lot * 0.35);
-
          if(profit > threshold)
          {
             PrintFormat("【平仓判定】PositionID:%I64u 利润:%.2f > 阈值%.2f → 按止盈处理", position_id, profit, threshold);
             return true;
          }
-
          PrintFormat("【平仓判定】PositionID:%I64u 平仓价:%.5f 利润:%.2f Reason:%d → 非止盈",
                      position_id, closePrice, profit, reason);
          return false;
       }
-
       if(retry < 7) Sleep(120 + retry * 60);
    }
-
    PrintFormat("【平仓判定】PositionID:%I64u 多次重试仍未找到OUT成交 → 按非止盈处理", position_id);
    return false;
 }
-
 //+------------------------------------------------------------------+
 //| 下单逻辑                                                           |
 //+------------------------------------------------------------------+
 void ExecuteShortOrder()
 {
    SetTradeFillingMode();
-
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
    {
       Print("【错误】获取Tick失败，错误码: ", GetLastError());
       return;
    }
-
    const double bid = tick.bid;
    const double virtual_sl = NormalizeDouble(bid + SL_USD, _Digits);
    const double virtual_tp = NormalizeDouble(bid - TP_USD, _Digits);
-
    if(trade.Sell(LotShort, _Symbol, bid, 0, 0, ""))
    {
       ulong deal_ticket = trade.ResultDeal();
       g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ?
                               HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID();
-
       g_virtual_sl_price = virtual_sl;
       g_virtual_tp_price = virtual_tp;
-
       double rev_tp = NormalizeDouble(virtual_sl + REV_TP_USD, _Digits);
       double rev_sl = NormalizeDouble(virtual_sl - REV_SL_USD, _Digits);
-
       if(trade.BuyStop(LotLongReverse, virtual_sl, _Symbol, 0, 0, ORDER_TIME_GTC, 0, ""))
          g_reverse_order_ticket = trade.ResultOrder();
-
       g_monitoring_reverse_position = false;
       g_reverse_tp_price = rev_tp;
       g_reverse_sl_price = rev_sl;
-
       PrintFormat("【初始做空成功-虚拟】持仓ID: %I64u, 反向挂单Ticket: %I64u | 虚拟SL:%.5f TP:%.5f | 反向虚拟SL:%.5f TP:%.5f",
                   g_monitor_position_id, g_reverse_order_ticket,
                   g_virtual_sl_price, g_virtual_tp_price, rev_sl, rev_tp);
@@ -489,41 +455,32 @@ void ExecuteShortOrder()
                   trade.ResultRetcode(), trade.ResultRetcodeDescription());
    }
 }
-
 void ExecuteLongOrder()
 {
    SetTradeFillingMode();
-
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
    {
       Print("【错误】获取Tick失败，错误码: ", GetLastError());
       return;
    }
-
    const double ask = tick.ask;
    const double virtual_sl = NormalizeDouble(ask - SL_USD, _Digits);
    const double virtual_tp = NormalizeDouble(ask + TP_USD, _Digits);
-
    if(trade.Buy(LotLong, _Symbol, ask, 0, 0, ""))
    {
       ulong deal_ticket = trade.ResultDeal();
       g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ?
                               HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID();
-
       g_virtual_sl_price = virtual_sl;
       g_virtual_tp_price = virtual_tp;
-
       double rev_tp = NormalizeDouble(virtual_sl - REV_TP_USD, _Digits);
       double rev_sl = NormalizeDouble(virtual_sl + REV_SL_USD, _Digits);
-
       if(trade.SellStop(LotShortReverse, virtual_sl, _Symbol, 0, 0, ORDER_TIME_GTC, 0, ""))
          g_reverse_order_ticket = trade.ResultOrder();
-
       g_monitoring_reverse_position = false;
       g_reverse_tp_price = rev_tp;
       g_reverse_sl_price = rev_sl;
-
       PrintFormat("【初始做多成功-虚拟】持仓ID: %I64u, 反向挂单Ticket: %I64u | 虚拟SL:%.5f TP:%.5f | 反向虚拟SL:%.5f TP:%.5f",
                   g_monitor_position_id, g_reverse_order_ticket,
                   g_virtual_sl_price, g_virtual_tp_price, rev_sl, rev_tp);
@@ -535,7 +492,6 @@ void ExecuteLongOrder()
                   trade.ResultRetcode(), trade.ResultRetcodeDescription());
    }
 }
-
 //+------------------------------------------------------------------+
 //| 【核心加固】虚拟止损/止盈检查 + 兜底全扫描                         |
 //+------------------------------------------------------------------+
@@ -550,7 +506,6 @@ void CheckVirtualStopsAndClose()
       long  posType = -1;
       double currentPrice = 0.0;
       double openPrice = 0.0;
-
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
          ulong pt = PositionGetTicket(i);
@@ -571,7 +526,6 @@ void CheckVirtualStopsAndClose()
             }
          }
       }
-
       if(found)
       {
          // 如果是反向单，定期用真实开仓价重新校准虚拟价位（防止之前设置错误）
@@ -588,7 +542,6 @@ void CheckVirtualStopsAndClose()
                expected_tp = NormalizeDouble(openPrice - REV_TP_USD, _Digits);
                expected_sl = NormalizeDouble(openPrice + REV_SL_USD, _Digits);
             }
-
             // 如果偏差超过 1 点，强制更新
             if(MathAbs(g_virtual_tp_price - expected_tp) > 1.0 ||
                MathAbs(g_virtual_sl_price - expected_sl) > 1.0)
@@ -601,10 +554,8 @@ void CheckVirtualStopsAndClose()
                            g_monitor_position_id, openPrice, g_virtual_tp_price, g_virtual_sl_price);
             }
          }
-
          bool hitTP = false;
          bool hitSL = false;
-
          if(posType == POSITION_TYPE_BUY)
          {
             if(g_virtual_tp_price > 0.0 && currentPrice >= g_virtual_tp_price) hitTP = true;
@@ -615,78 +566,266 @@ void CheckVirtualStopsAndClose()
             if(g_virtual_tp_price > 0.0 && currentPrice <= g_virtual_tp_price) hitTP = true;
             if(g_virtual_sl_price > 0.0 && currentPrice >= g_virtual_sl_price) hitSL = true;
          }
-
          if(hitTP || hitSL)
          {
             string reason = hitTP ? "虚拟止盈" : "虚拟止损";
             PrintFormat("【虚拟平仓】触发%s | 持仓ID:%I64u | 当前价:%.5f | 虚拟TP:%.5f | 虚拟SL:%.5f",
                         reason, g_monitor_position_id, currentPrice, g_virtual_tp_price, g_virtual_sl_price);
-
+            // ★ 关键：明确记录本次平仓原因
+            g_last_close_was_tp = hitTP;
             if(trade.PositionClose(posTicket))
+            {
                PrintFormat("【虚拟平仓成功】%s 已执行", reason);
+               // ★ v2.1.5：初始单止盈后设置延迟撤单（默认5秒，保留并发保护）
+               if(hitTP && !g_monitoring_reverse_position)
+               {
+                  g_pending_cancel_time = TimeTradeServer() + CancelDelaySec;
+                  g_monitor_position_id = INVALID_POSITION_ID;
+                  g_virtual_sl_price = 0.0;
+                  g_virtual_tp_price = 0.0;
+                  PrintFormat("【虚拟止盈】已进入 %d 秒延迟撤单期，将撤销未成交反向挂单", CancelDelaySec);
+               }
+            }
             else
                PrintFormat("【虚拟平仓失败】错误码: %d", trade.ResultRetcode());
             return; // 已处理，本轮结束
          }
       }
    }
-
    // ===== 2. 兜底全扫描：防止监控变量丢失导致单子跑飞 =====
-   // 只要发现本EA持仓的价格移动已经超过对应阈值，就强制平仓
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong pt = PositionGetTicket(i);
       if(pt == 0 || !PositionSelectByTicket(pt)) continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
-
       long   posType   = PositionGetInteger(POSITION_TYPE);
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double curPrice  = (posType == POSITION_TYPE_BUY) ?
                          SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                          SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double priceMove = (posType == POSITION_TYPE_BUY) ? (curPrice - openPrice) : (openPrice - curPrice);
-
       // 判断是用初始阈值还是反向阈值
-      // 优先使用当前监控状态，否则用更宽松的反向阈值作为安全网
       double tpThreshold = g_monitoring_reverse_position ? REV_TP_USD : TP_USD;
       double slThreshold = g_monitoring_reverse_position ? REV_SL_USD : SL_USD;
-
-      // 如果当前没有监控任何单，或者ID对不上，用反向阈值作为更安全的兜底（防止大亏）
+      // 如果当前没有监控任何单，或者ID对不上，用反向阈值作为更安全的兜底
       if(g_monitor_position_id == INVALID_POSITION_ID ||
          PositionGetInteger(POSITION_IDENTIFIER) != (long)g_monitor_position_id)
       {
-         tpThreshold = REV_TP_USD;   // 兜底用反向止盈
+         tpThreshold = REV_TP_USD;
          slThreshold = REV_SL_USD;
       }
-
       if(priceMove >= tpThreshold)
       {
          PrintFormat("【兜底虚拟止盈】强制平仓！Ticket:%I64u 开仓价:%.5f 当前价:%.5f 移动:%.2f >= 阈值:%.2f",
                      pt, openPrice, curPrice, priceMove, tpThreshold);
-         trade.PositionClose(pt);
-         // 清理状态，防止后续逻辑混乱
+         // ★ 重要：记录为止盈
+         g_last_close_was_tp = true;
+         if(trade.PositionClose(pt))
+         {
+            // ★ v2.1.5：兜底止盈后设置延迟撤单（保留并发保护）
+            if(!g_monitoring_reverse_position)
+            {
+               g_pending_cancel_time = TimeTradeServer() + CancelDelaySec;
+               PrintFormat("【兜底虚拟止盈】已进入 %d 秒延迟撤单期，将撤销未成交反向挂单", CancelDelaySec);
+            }
+         }
+         // 注意：这里不再强制清 g_monitoring_reverse_position，
+         // 让后面的 MonitorPositionStatus 正式逻辑去处理方向翻转
          g_monitor_position_id = INVALID_POSITION_ID;
          g_virtual_sl_price = 0.0;
          g_virtual_tp_price = 0.0;
-         g_monitoring_reverse_position = false;
+         // g_monitoring_reverse_position 保持原值，由正式逻辑清理
          return;
       }
-
       if(priceMove <= -slThreshold)
       {
          PrintFormat("【兜底虚拟止损】强制平仓！Ticket:%I64u 开仓价:%.5f 当前价:%.5f 移动:%.2f <= -阈值:%.2f",
                      pt, openPrice, curPrice, priceMove, slThreshold);
+         // ★ 重要：记录为止损
+         g_last_close_was_tp = false;
          trade.PositionClose(pt);
          g_monitor_position_id = INVALID_POSITION_ID;
          g_virtual_sl_price = 0.0;
          g_virtual_tp_price = 0.0;
-         g_monitoring_reverse_position = false;
+         // 同上，不强制清 g_monitoring_reverse_position
          return;
       }
    }
 }
-
+//+------------------------------------------------------------------+
+//| 【强化竞态修复】反向挂单成交瞬间立刻平掉初始单 + 对锁安全网       |
+//+------------------------------------------------------------------+
+void ForceCloseInitialIfReverseTriggered()
+{
+   // ========== 安全网：只要出现多空对锁，立刻处理 ==========
+   int buyCount = 0, sellCount = 0;
+   ulong buyTicket = 0, sellTicket = 0;
+   ulong buyID = 0, sellID = 0;
+   double buyOpen = 0.0, sellOpen = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong pt = PositionGetTicket(i);
+      if(pt == 0 || !PositionSelectByTicket(pt)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if(type == POSITION_TYPE_BUY)
+      {
+         buyCount++;
+         buyTicket = pt;
+         buyID     = PositionGetInteger(POSITION_IDENTIFIER);
+         buyOpen   = PositionGetDouble(POSITION_PRICE_OPEN);
+      }
+      else
+      {
+         sellCount++;
+         sellTicket = pt;
+         sellID     = PositionGetInteger(POSITION_IDENTIFIER);
+         sellOpen   = PositionGetDouble(POSITION_PRICE_OPEN);
+      }
+   }
+   // 出现多空对锁 → 强制平初始方向的单
+   if(buyCount > 0 && sellCount > 0)
+   {
+      ulong closeTicket = 0;
+      ulong keepID      = 0;
+      double keepOpen   = 0.0;
+      long   keepType   = -1;
+      if(g_currentDirection == DIR_SHORT)
+      {
+         closeTicket = sellTicket;   // 平初始空单
+         keepID      = buyID;
+         keepOpen    = buyOpen;
+         keepType    = POSITION_TYPE_BUY;
+      }
+      else
+      {
+         closeTicket = buyTicket;    // 平初始多单
+         keepID      = sellID;
+         keepOpen    = sellOpen;
+         keepType    = POSITION_TYPE_SELL;
+      }
+      if(closeTicket > 0)
+      {
+         PrintFormat("【竞态安全网】检测到多空对锁，强制平初始单 Ticket:%I64u", closeTicket);
+         if(trade.PositionClose(closeTicket))
+         {
+            g_monitor_position_id        = keepID;
+            g_monitoring_reverse_position = true;
+            g_reverse_order_ticket       = INVALID_ORDER_TICKET;
+            g_last_close_was_tp          = false;
+            g_pending_reverse_check_time = 0;
+            if(keepOpen > 0.0)
+            {
+               if(keepType == POSITION_TYPE_BUY)
+               {
+                  g_virtual_tp_price = NormalizeDouble(keepOpen + REV_TP_USD, _Digits);
+                  g_virtual_sl_price = NormalizeDouble(keepOpen - REV_SL_USD, _Digits);
+               }
+               else
+               {
+                  g_virtual_tp_price = NormalizeDouble(keepOpen - REV_TP_USD, _Digits);
+                  g_virtual_sl_price = NormalizeDouble(keepOpen + REV_SL_USD, _Digits);
+               }
+               g_reverse_tp_price = g_virtual_tp_price;
+               g_reverse_sl_price = g_virtual_sl_price;
+               PrintFormat("【竞态安全网】已接管反向单 ID:%I64u  TP:%.5f  SL:%.5f", keepID, g_virtual_tp_price, g_virtual_sl_price);
+            }
+            return;   // 已处理，直接返回
+         }
+      }
+   }
+   // ========== 正常逻辑：检测反向挂单是否刚成交 ==========
+   if(g_reverse_order_ticket == INVALID_ORDER_TICKET || g_monitoring_reverse_position)
+      return;
+   bool reverseStillPending = false;
+   if(OrderSelect(g_reverse_order_ticket))
+   {
+      if(OrderGetInteger(ORDER_STATE) == ORDER_STATE_PLACED)
+         reverseStillPending = true;
+   }
+   if(reverseStillPending) return;   // 挂单还在，不用处理
+   // 反向挂单已消失，检查初始单是否还在
+   ulong initialTicket = 0;
+   ulong initialID     = g_monitor_position_id;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong pt = PositionGetTicket(i);
+      if(pt == 0 || !PositionSelectByTicket(pt)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      if(PositionGetInteger(POSITION_IDENTIFIER) == (long)initialID)
+      {
+         initialTicket = pt;
+         break;
+      }
+   }
+   if(initialTicket > 0)
+   {
+      PrintFormat("【竞态瞬间修复】反向挂单已成交，初始单(ID:%I64u)仍存在，立即强制平仓！", initialID);
+      if(!trade.PositionClose(initialTicket))
+      {
+         PrintFormat("【竞态瞬间修复】强制平仓失败，错误码:%d，下一秒重试", trade.ResultRetcode());
+         return;
+      }
+      PrintFormat("【竞态瞬间修复】初始单强制平仓成功 Ticket:%I64u", initialTicket);
+   }
+   // 寻找并接管反向持仓
+   ulong newPosID = INVALID_POSITION_ID;
+   double openPrice = 0.0;
+   long   posType   = -1;
+   for(int retry = 0; retry < 8; retry++)
+   {
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong pt = PositionGetTicket(i);
+         if(pt == 0 || !PositionSelectByTicket(pt)) continue;
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+         ulong posID = PositionGetInteger(POSITION_IDENTIFIER);
+         if(posID != initialID)
+         {
+            newPosID  = posID;
+            openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            posType   = PositionGetInteger(POSITION_TYPE);
+            break;
+         }
+      }
+      if(newPosID != INVALID_POSITION_ID) break;
+      Sleep(60);
+   }
+   if(newPosID != INVALID_POSITION_ID)
+   {
+      g_monitor_position_id        = newPosID;
+      g_monitoring_reverse_position = true;
+      g_reverse_order_ticket       = INVALID_ORDER_TICKET;
+      g_last_close_was_tp          = false;
+      g_pending_reverse_check_time = 0;
+      if(openPrice > 0.0)
+      {
+         if(posType == POSITION_TYPE_BUY)
+         {
+            g_virtual_tp_price = NormalizeDouble(openPrice + REV_TP_USD, _Digits);
+            g_virtual_sl_price = NormalizeDouble(openPrice - REV_SL_USD, _Digits);
+         }
+         else
+         {
+            g_virtual_tp_price = NormalizeDouble(openPrice - REV_TP_USD, _Digits);
+            g_virtual_sl_price = NormalizeDouble(openPrice + REV_SL_USD, _Digits);
+         }
+         g_reverse_tp_price = g_virtual_tp_price;
+         g_reverse_sl_price = g_virtual_sl_price;
+         PrintFormat("【竞态瞬间修复】已接管反向单 ID:%I64u  开仓价:%.5f  TP:%.5f  SL:%.5f",
+                     newPosID, openPrice, g_virtual_tp_price, g_virtual_sl_price);
+      }
+   }
+   else
+   {
+      g_reverse_order_ticket = INVALID_ORDER_TICKET;
+      Print("【竞态瞬间修复】反向挂单消失但未找到对应持仓，已清理记录");
+   }
+}
 //+------------------------------------------------------------------+
 //| 监控持仓状态（加固版）                                             |
 //+------------------------------------------------------------------+
@@ -694,7 +833,8 @@ void MonitorPositionStatus()
 {
    // ★★★ 优先执行虚拟止损/止盈检查（含兜底） ★★★
    CheckVirtualStopsAndClose();
-
+   // 2. 立刻检查：反向挂单是否刚刚成交 → 马上平初始单
+   ForceCloseInitialIfReverseTriggered();
    // 延迟撤单逻辑
    if(g_pending_cancel_time > 0)
    {
@@ -706,26 +846,13 @@ void MonitorPositionStatus()
       }
       return;
    }
-
-   if(g_monitor_position_id == INVALID_POSITION_ID) return;
-
-   bool isStillOpen = false;
-
-   // ========== 竞态修复：反向挂单已触发但初始单还在 ==========
-   if(g_reverse_order_ticket != INVALID_ORDER_TICKET && !g_monitoring_reverse_position)
+   // ========== 关键：先处理反向单离场（即使 ID 已被兜底清空也能走到） ==========
+   if(g_monitoring_reverse_position)
    {
-      bool reverseStillPending = false;
-      if(OrderSelect(g_reverse_order_ticket))
+      // 先确认当前监控的持仓是否已经真正消失
+      bool stillExists = false;
+      if(g_monitor_position_id != INVALID_POSITION_ID)
       {
-         long state = OrderGetInteger(ORDER_STATE);
-         if(state == ORDER_STATE_PLACED)
-            reverseStillPending = true;
-      }
-
-      if(!reverseStillPending)
-      {
-         bool initialStillOpen = false;
-         ulong initialTicket = 0;
          for(int i = PositionsTotal() - 1; i >= 0; i--)
          {
             ulong pt = PositionGetTicket(i);
@@ -735,40 +862,51 @@ void MonitorPositionStatus()
                   PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
                   PositionGetInteger(POSITION_IDENTIFIER) == (long)g_monitor_position_id)
                {
-                  initialStillOpen = true;
-                  initialTicket = pt;
+                  stillExists = true;
                   break;
                }
             }
          }
-
-         if(initialStillOpen)
-         {
-            PrintFormat("【竞态修复】反向挂单已触发成交，但初始持仓(ID:%I64u)仍存在！强制平仓。",
-                        g_monitor_position_id);
-
-            if(trade.PositionClose(initialTicket))
-            {
-               PrintFormat("【竞态修复】初始单强制平仓成功，Ticket:%I64u", initialTicket);
-               isStillOpen = false;
-            }
-            else
-            {
-               Sleep(150);
-               if(trade.PositionClose(initialTicket))
-               {
-                  PrintFormat("【竞态修复】初始单第二次强制平仓成功，Ticket:%I64u", initialTicket);
-                  isStillOpen = false;
-               }
-               else
-               {
-                  PrintFormat("【竞态修复】初始单强制平仓失败，错误码:%d", trade.ResultRetcode());
-               }
-            }
-         }
       }
+      if(stillExists) return;   // 还在，继续监控
+      // 已消失 → 进入延迟确认
+      if(g_pending_reverse_check_time == 0)
+      {
+         g_pending_reverse_check_time = TimeTradeServer() + 2;
+         PrintFormat("【监控通知】反向翻仓持仓(ID:%I64u)已离场，进入 2 秒延迟确认期...", g_monitor_position_id);
+         return;
+      }
+      if(TimeTradeServer() < g_pending_reverse_check_time) return;
+      PrintFormat("【延迟确认】开始最终判断反向持仓(ID:%I64u)是否止盈...", g_monitor_position_id);
+      // 优先使用自己记录的标志，再兜底历史判断
+      bool closedByTP = g_last_close_was_tp || IsPositionClosedByTP(g_monitor_position_id);
+      if(closedByTP && ReverseDirectionAfterSL)
+      {
+         g_currentDirection = (g_currentDirection == DIR_SHORT) ? DIR_LONG : DIR_SHORT;
+         PrintFormat("【方向更新】初始单止损 + 反向单止盈 → 已反转方向为: %s",
+                     (g_currentDirection == DIR_SHORT) ? "做空" : "做多");
+      }
+      else
+      {
+         PrintFormat("【方向保持】反向单非止盈离场，方向不反转，当前仍为: %s",
+                     (g_currentDirection == DIR_SHORT) ? "做空" : "做多");
+      }
+      // 清理所有状态
+      g_monitoring_reverse_position = false;
+      g_monitor_position_id = INVALID_POSITION_ID;
+      g_reverse_order_ticket = INVALID_ORDER_TICKET;
+      g_pending_reverse_check_time = 0;
+      g_reverse_tp_price = 0.0;
+      g_reverse_sl_price = 0.0;
+      g_virtual_sl_price = 0.0;
+      g_virtual_tp_price = 0.0;
+      g_last_close_was_tp = false;
+      return;
    }
-
+   // 下面是原来的逻辑（此时已经不是反向单监控状态了）
+   if(g_monitor_position_id == INVALID_POSITION_ID) return;
+   bool isStillOpen = false;
+   
    // 检查真实持仓是否还在
    if(!isStillOpen)
    {
@@ -787,60 +925,15 @@ void MonitorPositionStatus()
          }
       }
    }
-
    if(isStillOpen) return;
-
-   // === 持仓已消失，判断平仓原因 ===
-
-   // 情况1：当前监控的是反向翻仓单
-   if(g_monitoring_reverse_position)
-   {
-      if(g_pending_reverse_check_time == 0)
-      {
-         g_pending_reverse_check_time = TimeTradeServer() + 2;
-         PrintFormat("【监控通知】反向翻仓持仓(ID:%I64u)已离场，进入 2 秒延迟确认期...", g_monitor_position_id);
-         return;
-      }
-
-      if(TimeTradeServer() < g_pending_reverse_check_time) return;
-
-      PrintFormat("【延迟确认】开始最终判断反向持仓(ID:%I64u)是否止盈...", g_monitor_position_id);
-
-      if(IsPositionClosedByTP(g_monitor_position_id) && ReverseDirectionAfterSL)
-      {
-         g_currentDirection = (g_currentDirection == DIR_SHORT) ? DIR_LONG : DIR_SHORT;
-         PrintFormat("【方向更新】初始单止损 + 反向单止盈 → 已反转方向为: %s",
-                     (g_currentDirection == DIR_SHORT) ? "做空" : "做多");
-      }
-      else
-      {
-         PrintFormat("【方向保持】反向单非止盈离场，方向不反转，当前仍为: %s",
-                     (g_currentDirection == DIR_SHORT) ? "做空" : "做多");
-      }
-
-      // 清理所有状态
-      g_monitoring_reverse_position = false;
-      g_monitor_position_id = INVALID_POSITION_ID;
-      g_reverse_order_ticket = INVALID_ORDER_TICKET;
-      g_pending_reverse_check_time = 0;
-      g_reverse_tp_price = 0.0;
-      g_reverse_sl_price = 0.0;
-      g_virtual_sl_price = 0.0;
-      g_virtual_tp_price = 0.0;
-      return;
-   }
-
-   // 情况2：当前监控的是初始单
+   // === 初始单已消失 ===
    bool isOrderTriggered = false;
    ulong newPositionID = INVALID_POSITION_ID;
-
    if(g_reverse_order_ticket != INVALID_ORDER_TICKET)
    {
       if(!OrderSelect(g_reverse_order_ticket) || OrderGetInteger(ORDER_STATE) != ORDER_STATE_PLACED)
       {
          isOrderTriggered = true;
-
-         // 寻找新持仓（带重试）
          for(int retry = 0; retry < 5; retry++)
          {
             for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -865,21 +958,17 @@ void MonitorPositionStatus()
          }
       }
    }
-
    if(isOrderTriggered && newPositionID != INVALID_POSITION_ID)
    {
       // ========== 初始单止损 → 反向单已激活 ==========
       PrintFormat("【监控通知】初始持仓止损离场，反向翻仓单已激活！新持仓ID: %I64u", newPositionID);
-
       g_monitor_position_id = newPositionID;
       g_monitoring_reverse_position = true;
       g_reverse_order_ticket = INVALID_ORDER_TICKET;
-
-      // ★★★ 强制用真实成交价重算虚拟TP/SL（带重试） ★★★
+      g_last_close_was_tp = false;
       bool foundPos = false;
       double openPrice = 0.0;
       long   posType   = -1;
-
       for(int retry = 0; retry < 6; retry++)
       {
          for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -901,7 +990,6 @@ void MonitorPositionStatus()
          if(foundPos) break;
          Sleep(100);
       }
-
       if(foundPos && openPrice > 0.0)
       {
          if(posType == POSITION_TYPE_BUY)
@@ -914,16 +1002,13 @@ void MonitorPositionStatus()
             g_virtual_tp_price = NormalizeDouble(openPrice - REV_TP_USD, _Digits);
             g_virtual_sl_price = NormalizeDouble(openPrice + REV_SL_USD, _Digits);
          }
-
          g_reverse_tp_price = g_virtual_tp_price;
          g_reverse_sl_price = g_virtual_sl_price;
-
          PrintFormat("【记录反向单虚拟价位-真实成交价】ID:%I64u  开仓价:%.5f  虚拟SL:%.5f  虚拟TP:%.5f",
                      newPositionID, openPrice, g_virtual_sl_price, g_virtual_tp_price);
       }
       else
       {
-         // 兜底
          g_virtual_sl_price = g_reverse_sl_price;
          g_virtual_tp_price = g_reverse_tp_price;
          PrintFormat("【记录反向单虚拟价位-兜底预存值】ID:%I64u  虚拟SL:%.5f  虚拟TP:%.5f （注意：可能存在偏差）",
@@ -935,15 +1020,15 @@ void MonitorPositionStatus()
       // ========== 初始单虚拟止盈离场 ==========
       PrintFormat("【监控通知】初始持仓(ID:%I64u)已正常止盈离场！进入 %d 秒并发保护观察期...",
                   g_monitor_position_id, CancelDelaySec);
-
+      // ★ v2.1.5：止盈后设置延迟撤单（默认5秒，保留并发保护）
       g_pending_cancel_time = TimeTradeServer() + CancelDelaySec;
       g_monitor_position_id = INVALID_POSITION_ID;
       g_monitoring_reverse_position = false;
       g_virtual_sl_price = 0.0;
       g_virtual_tp_price = 0.0;
+      g_last_close_was_tp = false;
    }
 }
-
 //+------------------------------------------------------------------+
 //| 库存费避让相关函数（保持原逻辑）                                   |
 //+------------------------------------------------------------------+
@@ -951,7 +1036,6 @@ bool IsInSwapAvoidWindow(datetime serverTime)
 {
    MqlDateTime dt;
    TimeToStruct(serverTime, dt);
-
    if(AvoidSwapWednesdayOnly)
    {
       if(dt.day_of_week == 3)
@@ -971,12 +1055,10 @@ bool IsInSwapAvoidWindow(datetime serverTime)
       return false;
    }
 }
-
 bool IsInPreSwapWindow(datetime serverTime)
 {
    MqlDateTime dt;
    TimeToStruct(serverTime, dt);
-
    if(AvoidSwapWednesdayOnly)
    {
       if(dt.day_of_week == 3 && dt.hour == 23 && dt.min >= (60 - AvoidSwapBeforeMin))
@@ -990,21 +1072,17 @@ bool IsInPreSwapWindow(datetime serverTime)
       return false;
    }
 }
-
 void ScanAndCloseProfitablePositions()
 {
    bool hasProfitable = false;
    int closedCount = 0;
-
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong posTicket = PositionGetTicket(i);
       if(posTicket == 0) continue;
       if(!PositionSelectByTicket(posTicket)) continue;
-
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
-
       double profit = PositionGetDouble(POSITION_PROFIT);
       if(profit > 8.0)
       {
@@ -1021,7 +1099,6 @@ void ScanAndCloseProfitablePositions()
          }
       }
    }
-
    if(hasProfitable)
    {
       int deletedCount = 0;
@@ -1030,10 +1107,8 @@ void ScanAndCloseProfitablePositions()
          ulong orderTicket = OrderGetTicket(i);
          if(orderTicket == 0) continue;
          if(!OrderSelect(orderTicket)) continue;
-
          if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
          if(OrderGetInteger(ORDER_MAGIC) != InpMagicNumber) continue;
-
          if(trade.OrderDelete(orderTicket))
          {
             deletedCount++;
@@ -1041,7 +1116,6 @@ void ScanAndCloseProfitablePositions()
             Sleep(100);
          }
       }
-
       g_monitor_position_id = INVALID_POSITION_ID;
       g_reverse_order_ticket = INVALID_ORDER_TICKET;
       g_pending_cancel_time = 0;
@@ -1050,12 +1124,10 @@ void ScanAndCloseProfitablePositions()
       g_virtual_tp_price = 0.0;
       g_reverse_sl_price = 0.0;
       g_reverse_tp_price = 0.0;
-
       PrintFormat("【库存费避让】扫描完成：平仓 %d 个盈利仓位，撤销 %d 个挂单。亏损仓位已保留。",
                   closedCount, deletedCount);
    }
 }
-
 bool HasSkipOpenSignal()
 {
    for(int i = OrdersTotal() - 1; i >= 0; i--)
@@ -1063,10 +1135,8 @@ bool HasSkipOpenSignal()
       ulong ticket = OrderGetTicket(i);
       if(ticket == 0) continue;
       if(!OrderSelect(ticket)) continue;
-
       if(!IsSameBaseSymbol(OrderGetString(ORDER_SYMBOL), _Symbol)) continue;
       if(OrderGetInteger(ORDER_MAGIC) != InpMagicNumber) continue;
-
       string comment = OrderGetString(ORDER_COMMENT);
       if(StringFind(comment, "SKIP") >= 0 || StringFind(comment, "暂停") >= 0)
       {
@@ -1077,32 +1147,26 @@ bool HasSkipOpenSignal()
    }
    return false;
 }
-
 //+------------------------------------------------------------------+
 //| 定时器主逻辑                                                       |
 //+------------------------------------------------------------------+
 void OnTimer()
 {
    const datetime serverNow = TimeTradeServer();
-
    if(g_stop_on_drawdown) return;
    if(g_target_reached) return;
-
    // 1. 优先执行基础检查与持仓监控（即使在Swap避让期也要跑）
    CheckAndCloseAllPositions();
    if(g_target_reached) return;
    MonitorPositionStatus();
-
    // 2. 库存费规避窗口
    if(IsInSwapAvoidWindow(serverNow))
    {
       if(IsInPreSwapWindow(serverNow))
          ScanAndCloseProfitablePositions();
-
       g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
       return;
    }
-
    // 3. 周末过滤
    if(!EnableWeekendTrading)
    {
@@ -1114,24 +1178,19 @@ void OnTimer()
          return;
       }
    }
-
    // 4. 定时开仓触发
    if(serverNow < g_nextTriggerTime) return;
-
    if(serverNow - g_nextTriggerTime > 5)
    {
       g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
       return;
    }
-
    datetime nextAfterThis = CalculateNextTriggerTime(serverNow);
-
    if(serverNow - g_lastTradeTime < RepeatGuardMin * 60)
    {
       g_nextTriggerTime = nextAfterThis;
       return;
    }
-
    if(CheckHasAnyPendingOrder() || CheckHasAnyPosition())
    {
       PrintFormat("【定时任务】时间: %s，存在未成交委托或已成交仓位，跳过本次执行。下次触发: %s",
@@ -1140,7 +1199,6 @@ void OnTimer()
       g_nextTriggerTime = nextAfterThis;
       return;
    }
-
    if(HasSkipOpenSignal())
    {
       PrintFormat("【手机控制】检测到跳过开仓信号，本次不执行开仓。时间: %s",
@@ -1148,11 +1206,9 @@ void OnTimer()
       g_nextTriggerTime = nextAfterThis;
       return;
    }
-
    // 执行开仓
    if(g_currentDirection == DIR_SHORT) ExecuteShortOrder();
    else                                 ExecuteLongOrder();
-
    g_lastTradeTime = serverNow;
    g_nextTriggerTime = nextAfterThis;
 }
