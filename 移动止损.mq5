@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "3.0.0"
+#property version   "3.1.0"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -29,10 +29,12 @@ input double TP_USD             = 23;       // 止盈(美元，XAUUSD价格差)
 input double SL_USD             = 18;       // 初始单移动止损价差（固定价差）
 input double REV_SL_USD         = 18;       // 反向单移动止损价差（固定价差）
 input double REV_TP_USD         = 23;       // 翻仓单止盈价差，默认18
-input int    IntervalMinutes    = 15;        // 开仓间隔(分钟)
+input double BE_Activate_USD    = 10.0;     // 浮盈达到多少点后启动保本锁利
+input double BE_Lock_USD        = 2.0;      // 保本锁定利润点数（开仓价±此值）
+input int    IntervalMinutes    = 15;       // 开仓间隔(分钟)
 input int    RepeatGuardMin     = 2;        // 防重复间隔(分钟)
 input int    CancelDelaySec     = 5;        // 延迟撤单秒数（已基本不用，保留兼容）
-input double TargetNetProfit    = 500;  // 目标净值(达到后全部平仓并停止)
+input double TargetNetProfit    = 500;      // 目标净值(达到后全部平仓并停止)
 input double MaxDrawdownPct     = 50.0;     // 最大回撤率(%)，达到后终止EA并清仓
 input bool   ReverseDirectionAfterSL = true; // 初始单止损 + 反向单止盈后，是否反转方向
 //===== 隔夜库存费规避参数 =====
@@ -58,6 +60,7 @@ double   g_reverse_sl_price = 0.0;
 double   g_virtual_sl_price = 0.0;
 double   g_virtual_tp_price = 0.0;
 bool     g_last_close_was_tp = false;
+bool     g_be_activated = false;          // ★★★ 当前持仓是否已启动保本
 // ★★★ 库存费前盈利平仓后，过了窗口按原方向重新开仓 ★★★
 bool                 g_need_reopen_after_swap = false;
 ENUM_INIT_DIRECTION  g_reopen_direction       = DIR_SHORT;
@@ -75,9 +78,9 @@ int OnInit()
    g_nextTriggerTime = CalculateNextTriggerTime(TimeTradeServer());
    g_currentDirection = InitialDirection;
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v3.0.0【双移动止损+止损后立即翻仓】规则：定时自动做空 | 间隔:%d分钟 | 目标净值:%.2f", IntervalMinutes, TargetNetProfit);
+      PrintFormat("EA启动 v3.1.0【保本+移动止损+止损后立即翻仓】规则：定时自动做空 | 间隔:%d分钟 | 目标净值:%.2f", IntervalMinutes, TargetNetProfit);
    else
-      PrintFormat("EA启动 v3.0.0【双移动止损+止损后立即翻仓】规则：定时自动做多 | 间隔:%d分钟 | 目标净值:%.2f", IntervalMinutes, TargetNetProfit);
+      PrintFormat("EA启动 v3.1.0【保本+移动止损+止损后立即翻仓】规则：定时自动做多 | 间隔:%d分钟 | 目标净值:%.2f", IntervalMinutes, TargetNetProfit);
    return INIT_SUCCEEDED;
 }
 //+------------------------------------------------------------------+
@@ -418,7 +421,7 @@ void ExecuteReverseOrder()
       Print("【错误】获取Tick失败，错误码: ", GetLastError());
       return;
    }
-
+   g_be_activated = false;   // ★★★ 新仓重置保本状态
    if(g_currentDirection == DIR_SHORT)
    {
       // 初始做空 → 反向做多
@@ -431,7 +434,6 @@ void ExecuteReverseOrder()
          g_monitoring_reverse_position = true;
          g_last_close_was_tp = false;
          g_reverse_order_ticket = INVALID_ORDER_TICKET;
-
          double openPrice = 0.0;
          for(int i = PositionsTotal()-1; i>=0; i--)
          {
@@ -444,14 +446,12 @@ void ExecuteReverseOrder()
             }
          }
          if(openPrice <= 0.0) openPrice = ask;
-
          // 初始虚拟止盈（固定）+ 虚拟止损（后续移动）
          g_virtual_tp_price = NormalizeDouble(openPrice + REV_TP_USD, _Digits);
          g_virtual_sl_price = NormalizeDouble(openPrice - REV_SL_USD, _Digits);
          g_reverse_tp_price = g_virtual_tp_price;
          g_reverse_sl_price = g_virtual_sl_price;
-
-         PrintFormat("【反向翻仓成功-多】持仓ID:%I64u 开仓价:%.5f 初始虚拟TP:%.5f SL:%.5f（后续移动）",
+         PrintFormat("【反向翻仓成功-多】持仓ID:%I64u 开仓价:%.5f 初始虚拟TP:%.5f SL:%.5f（后续移动+保本）",
                      g_monitor_position_id, openPrice, g_virtual_tp_price, g_virtual_sl_price);
       }
       else
@@ -471,7 +471,6 @@ void ExecuteReverseOrder()
          g_monitoring_reverse_position = true;
          g_last_close_was_tp = false;
          g_reverse_order_ticket = INVALID_ORDER_TICKET;
-
          double openPrice = 0.0;
          for(int i = PositionsTotal()-1; i>=0; i--)
          {
@@ -484,13 +483,11 @@ void ExecuteReverseOrder()
             }
          }
          if(openPrice <= 0.0) openPrice = bid;
-
          g_virtual_tp_price = NormalizeDouble(openPrice - REV_TP_USD, _Digits);
          g_virtual_sl_price = NormalizeDouble(openPrice + REV_SL_USD, _Digits);
          g_reverse_tp_price = g_virtual_tp_price;
          g_reverse_sl_price = g_virtual_sl_price;
-
-         PrintFormat("【反向翻仓成功-空】持仓ID:%I64u 开仓价:%.5f 初始虚拟TP:%.5f SL:%.5f（后续移动）",
+         PrintFormat("【反向翻仓成功-空】持仓ID:%I64u 开仓价:%.5f 初始虚拟TP:%.5f SL:%.5f（后续移动+保本）",
                      g_monitor_position_id, openPrice, g_virtual_tp_price, g_virtual_sl_price);
       }
       else
@@ -514,7 +511,7 @@ void ExecuteShortOrder()
    const double bid = tick.bid;
    const double virtual_sl = NormalizeDouble(bid + SL_USD, _Digits);
    const double virtual_tp = NormalizeDouble(bid - TP_USD, _Digits);
-
+   g_be_activated = false;   // ★★★ 新仓重置保本状态
    if(trade.Sell(LotShort, _Symbol, bid, 0, 0, ""))
    {
       ulong deal_ticket = trade.ResultDeal();
@@ -525,8 +522,7 @@ void ExecuteShortOrder()
       g_monitoring_reverse_position = false;
       g_reverse_order_ticket = INVALID_ORDER_TICKET;
       g_last_close_was_tp = false;
-
-      PrintFormat("【初始做空成功-移动止损】持仓ID: %I64u | 初始虚拟SL:%.5f TP:%.5f",
+      PrintFormat("【初始做空成功-移动止损+保本】持仓ID: %I64u | 初始虚拟SL:%.5f TP:%.5f",
                   g_monitor_position_id, g_virtual_sl_price, g_virtual_tp_price);
    }
    else
@@ -547,7 +543,7 @@ void ExecuteLongOrder()
    const double ask = tick.ask;
    const double virtual_sl = NormalizeDouble(ask - SL_USD, _Digits);
    const double virtual_tp = NormalizeDouble(ask + TP_USD, _Digits);
-
+   g_be_activated = false;   // ★★★ 新仓重置保本状态
    if(trade.Buy(LotLong, _Symbol, ask, 0, 0, ""))
    {
       ulong deal_ticket = trade.ResultDeal();
@@ -558,8 +554,7 @@ void ExecuteLongOrder()
       g_monitoring_reverse_position = false;
       g_reverse_order_ticket = INVALID_ORDER_TICKET;
       g_last_close_was_tp = false;
-
-      PrintFormat("【初始做多成功-移动止损】持仓ID: %I64u | 初始虚拟SL:%.5f TP:%.5f",
+      PrintFormat("【初始做多成功-移动止损+保本】持仓ID: %I64u | 初始虚拟SL:%.5f TP:%.5f",
                   g_monitor_position_id, g_virtual_sl_price, g_virtual_tp_price);
    }
    else
@@ -569,7 +564,7 @@ void ExecuteLongOrder()
    }
 }
 //+------------------------------------------------------------------+
-//| 【核心】虚拟移动止损（初始+反向） + 固定止盈检查 + 兜底全扫描       |
+//| 【核心】虚拟移动止损（初始+反向） + 保本锁利 + 固定止盈检查 + 兜底全扫描
 //+------------------------------------------------------------------+
 void CheckVirtualStopsAndClose()
 {
@@ -582,7 +577,6 @@ void CheckVirtualStopsAndClose()
       long  posType = -1;
       double currentPrice = 0.0;
       double openPrice = 0.0;
-
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
          ulong pt = PositionGetTicket(i);
@@ -603,12 +597,37 @@ void CheckVirtualStopsAndClose()
             }
          }
       }
-
       if(found)
       {
-         // ★★★ 统一移动止损更新（初始用 SL_USD，反向用 REV_SL_USD）★★★
          double trailDistance = g_monitoring_reverse_position ? REV_SL_USD : SL_USD;
 
+         // ★★★★★ 保本锁利逻辑（多空通用）★★★★★
+         if(!g_be_activated && BE_Activate_USD > 0.0)
+         {
+            double floatingProfit = 0.0;
+            if(posType == POSITION_TYPE_BUY)
+               floatingProfit = currentPrice - openPrice;
+            else
+               floatingProfit = openPrice - currentPrice;
+
+            if(floatingProfit >= BE_Activate_USD)
+            {
+               if(posType == POSITION_TYPE_BUY)
+                  g_virtual_sl_price = NormalizeDouble(openPrice + BE_Lock_USD, _Digits);
+               else
+                  g_virtual_sl_price = NormalizeDouble(openPrice - BE_Lock_USD, _Digits);
+
+               g_be_activated = true;
+               if(g_monitoring_reverse_position)
+                  g_reverse_sl_price = g_virtual_sl_price;
+
+               PrintFormat("【保本启动】持仓ID:%I64u 浮盈:%.2f >= %.2f → 锁定止损到 %.5f（开仓价±%.2f）",
+                           g_monitor_position_id, floatingProfit, BE_Activate_USD,
+                           g_virtual_sl_price, BE_Lock_USD);
+            }
+         }
+
+         // ★★★ 统一移动止损更新（保本后继续移动）★★★
          if(posType == POSITION_TYPE_BUY)
          {
             // 多单：止损只能上移
@@ -632,7 +651,7 @@ void CheckVirtualStopsAndClose()
             }
          }
 
-         // 反向单止盈保持固定（只校准一次即可，不强制覆盖移动止损）
+         // 反向单止盈保持固定
          if(g_monitoring_reverse_position && openPrice > 0.0)
          {
             double expected_tp = 0.0;
@@ -640,7 +659,6 @@ void CheckVirtualStopsAndClose()
                expected_tp = NormalizeDouble(openPrice + REV_TP_USD, _Digits);
             else
                expected_tp = NormalizeDouble(openPrice - REV_TP_USD, _Digits);
-
             if(MathAbs(g_virtual_tp_price - expected_tp) > 1.0)
             {
                g_virtual_tp_price = expected_tp;
@@ -663,19 +681,15 @@ void CheckVirtualStopsAndClose()
             if(g_virtual_tp_price > 0.0 && currentPrice <= g_virtual_tp_price) hitTP = true;
             if(g_virtual_sl_price > 0.0 && currentPrice >= g_virtual_sl_price) hitSL = true;
          }
-
          if(hitTP || hitSL)
          {
-            string reason = hitTP ? "虚拟止盈" : "虚拟止损(移动)";
+            string reason = hitTP ? "虚拟止盈" : "虚拟止损(移动/保本)";
             PrintFormat("【虚拟平仓】触发%s | 持仓ID:%I64u | 当前价:%.5f | 虚拟TP:%.5f | 虚拟SL:%.5f",
                         reason, g_monitor_position_id, currentPrice, g_virtual_tp_price, g_virtual_sl_price);
-
             g_last_close_was_tp = hitTP;
-
             if(trade.PositionClose(posTicket))
             {
                PrintFormat("【虚拟平仓成功】%s 已执行", reason);
-
                // 初始单止损后，立即开反向翻仓单
                if(hitSL && !g_monitoring_reverse_position)
                {
@@ -683,6 +697,7 @@ void CheckVirtualStopsAndClose()
                   g_monitor_position_id = INVALID_POSITION_ID;
                   g_virtual_sl_price = 0.0;
                   g_virtual_tp_price = 0.0;
+                  g_be_activated = false;
                   ExecuteReverseOrder();
                }
                else if(hitTP && !g_monitoring_reverse_position)
@@ -691,6 +706,7 @@ void CheckVirtualStopsAndClose()
                   g_monitor_position_id = INVALID_POSITION_ID;
                   g_virtual_sl_price = 0.0;
                   g_virtual_tp_price = 0.0;
+                  g_be_activated = false;
                   Print("【初始单止盈】已平仓，不进行翻仓");
                }
             }
@@ -700,7 +716,6 @@ void CheckVirtualStopsAndClose()
          }
       }
    }
-
    // ===== 2. 兜底全扫描 =====
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -708,24 +723,20 @@ void CheckVirtualStopsAndClose()
       if(pt == 0 || !PositionSelectByTicket(pt)) continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
-
       long   posType   = PositionGetInteger(POSITION_TYPE);
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double curPrice  = (posType == POSITION_TYPE_BUY) ?
                          SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                          SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double priceMove = (posType == POSITION_TYPE_BUY) ? (curPrice - openPrice) : (openPrice - curPrice);
-
       double tpThreshold = g_monitoring_reverse_position ? REV_TP_USD : TP_USD;
       double slThreshold = g_monitoring_reverse_position ? REV_SL_USD : SL_USD;
-
       if(g_monitor_position_id == INVALID_POSITION_ID ||
          PositionGetInteger(POSITION_IDENTIFIER) != (long)g_monitor_position_id)
       {
          tpThreshold = REV_TP_USD;
          slThreshold = REV_SL_USD;
       }
-
       if(priceMove >= tpThreshold)
       {
          PrintFormat("【兜底虚拟止盈】强制平仓！Ticket:%I64u 移动:%.2f >= %.2f", pt, priceMove, tpThreshold);
@@ -735,6 +746,7 @@ void CheckVirtualStopsAndClose()
             g_monitor_position_id = INVALID_POSITION_ID;
             g_virtual_sl_price = 0.0;
             g_virtual_tp_price = 0.0;
+            g_be_activated = false;
          }
          return;
       }
@@ -749,6 +761,7 @@ void CheckVirtualStopsAndClose()
                g_monitor_position_id = INVALID_POSITION_ID;
                g_virtual_sl_price = 0.0;
                g_virtual_tp_price = 0.0;
+               g_be_activated = false;
                Print("【兜底初始单止损】尝试立即反向翻仓...");
                ExecuteReverseOrder();
             }
@@ -757,6 +770,7 @@ void CheckVirtualStopsAndClose()
                g_monitor_position_id = INVALID_POSITION_ID;
                g_virtual_sl_price = 0.0;
                g_virtual_tp_price = 0.0;
+               g_be_activated = false;
             }
          }
          return;
@@ -769,7 +783,6 @@ void CheckVirtualStopsAndClose()
 void MonitorPositionStatus()
 {
    CheckVirtualStopsAndClose();
-
    if(g_pending_cancel_time > 0)
    {
       if(TimeTradeServer() >= g_pending_cancel_time)
@@ -779,7 +792,6 @@ void MonitorPositionStatus()
       }
       return;
    }
-
    if(g_monitoring_reverse_position)
    {
       bool stillExists = false;
@@ -801,7 +813,6 @@ void MonitorPositionStatus()
          }
       }
       if(stillExists) return;
-
       if(g_pending_reverse_check_time == 0)
       {
          g_pending_reverse_check_time = TimeTradeServer() + 2;
@@ -809,10 +820,8 @@ void MonitorPositionStatus()
          return;
       }
       if(TimeTradeServer() < g_pending_reverse_check_time) return;
-
       PrintFormat("【延迟确认】开始最终判断反向持仓(ID:%I64u)是否止盈...", g_monitor_position_id);
       bool closedByTP = g_last_close_was_tp || IsPositionClosedByTP(g_monitor_position_id);
-
       if(closedByTP && ReverseDirectionAfterSL)
       {
          g_currentDirection = (g_currentDirection == DIR_SHORT) ? DIR_LONG : DIR_SHORT;
@@ -824,7 +833,6 @@ void MonitorPositionStatus()
          PrintFormat("【方向保持】反向单非止盈离场，方向不反转，当前仍为: %s",
                      (g_currentDirection == DIR_SHORT) ? "做空" : "做多");
       }
-
       g_monitoring_reverse_position = false;
       g_monitor_position_id = INVALID_POSITION_ID;
       g_reverse_order_ticket = INVALID_ORDER_TICKET;
@@ -834,11 +842,10 @@ void MonitorPositionStatus()
       g_virtual_sl_price = 0.0;
       g_virtual_tp_price = 0.0;
       g_last_close_was_tp = false;
+      g_be_activated = false;
       return;
    }
-
    if(g_monitor_position_id == INVALID_POSITION_ID) return;
-
    bool isStillOpen = false;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -855,12 +862,12 @@ void MonitorPositionStatus()
       }
    }
    if(isStillOpen) return;
-
    PrintFormat("【监控通知】初始持仓(ID:%I64u)已离场（可能被外部平仓）", g_monitor_position_id);
    g_monitor_position_id = INVALID_POSITION_ID;
    g_virtual_sl_price = 0.0;
    g_virtual_tp_price = 0.0;
    g_last_close_was_tp = false;
+   g_be_activated = false;
 }
 //+------------------------------------------------------------------+
 //| 库存费避让相关函数                                                 |
@@ -963,6 +970,7 @@ void ScanAndCloseProfitablePositions()
       g_virtual_tp_price = 0.0;
       g_reverse_sl_price = 0.0;
       g_reverse_tp_price = 0.0;
+      g_be_activated = false;
       PrintFormat("【库存费避让】扫描完成：平仓 %d 个盈利仓位，撤销 %d 个挂单。亏损仓位已保留。",
                   closedCount, deletedCount);
    }
@@ -994,11 +1002,9 @@ void OnTimer()
    const datetime serverNow = TimeTradeServer();
    if(g_stop_on_drawdown) return;
    if(g_target_reached) return;
-
    CheckAndCloseAllPositions();
    if(g_target_reached) return;
    MonitorPositionStatus();
-
    if(IsInSwapAvoidWindow(serverNow))
    {
       if(IsInPreSwapWindow(serverNow))
@@ -1006,7 +1012,6 @@ void OnTimer()
       g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
       return;
    }
-
    if(g_need_reopen_after_swap)
    {
       if(!CheckHasAnyPendingOrder() && !CheckHasAnyPosition() && !HasSkipOpenSignal())
@@ -1030,7 +1035,6 @@ void OnTimer()
       g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
       return;
    }
-
    if(!EnableWeekendTrading)
    {
       MqlDateTime dt;
@@ -1041,7 +1045,6 @@ void OnTimer()
          return;
       }
    }
-
    if(serverNow < g_nextTriggerTime) return;
    if(serverNow - g_nextTriggerTime > 5)
    {
@@ -1069,7 +1072,6 @@ void OnTimer()
       g_nextTriggerTime = nextAfterThis;
       return;
    }
-
    if(g_currentDirection == DIR_SHORT) ExecuteShortOrder();
    else                                 ExecuteLongOrder();
    g_lastTradeTime = serverNow;
