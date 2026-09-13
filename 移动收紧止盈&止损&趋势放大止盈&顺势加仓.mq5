@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "3.3.0"
+#property version   "3.3.2"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -22,16 +22,20 @@ enum ENUM_INIT_DIRECTION
 input ulong   InpMagicNumber     = 888151;  // EA魔术码(用于区分订单)
 input ENUM_INIT_DIRECTION InitialDirection = DIR_SHORT; // 备用初始方向（仅当高周期趋势计算失败时使用）
 // ★★★ 高周期趋势参数（决定第一次开仓方向）★★★
-input ENUM_TIMEFRAMES HigherTF       = PERIOD_H1;   // 高周期时间框
+input ENUM_TIMEFRAMES HigherTF       = PERIOD_H4;   // 高周期时间框
 input int             TrendMAPeriod  = 50;          // 趋势MA周期
 input ENUM_MA_METHOD  TrendMAMethod  = MODE_EMA;    // 趋势MA方法
 input ENUM_APPLIED_PRICE TrendPrice  = PRICE_CLOSE; // 应用价格
+// ★新增：趋势过滤参数
+input int    TrendConfirmBars   = 3;     // 连续确认K线根数（建议2~4）
+input double TrendMinSlopePts   = 50.0;  // MA最小斜率（点数，过滤横盘，可按品种调整）
 input double LotShort           = 0.01;     // 初始做空手数
 input double LotLong            = 0.01;     // 初始做多手数
 input double LotLongReverse     = 0.01;     // 做空止损反向多单手数
 input double LotShortReverse    = 0.01;     // 做多止损反向空手数
 input double LotScaleIn         = 0.01;     // ★新增：锁定利润时加仓手数
 input bool   EnableScaleIn      = true;     // ★新增：是否启用锁定利润时加仓
+input double MinBalanceForScaleIn = 0.0;    // ★新增：账户余额达到此值才允许顺势加仓（0=不限制）
 input double TP_USD             = 22;       // 初始单移动止盈距离（逆势收紧）
 input double SL_USD             = 22;       // 初始单移动止损距离
 input double REV_SL_USD         = 22;       // 反向单移动止损距离
@@ -81,7 +85,7 @@ bool   g_scaled_in = false;                  // ★新增：是否已在本轮�
 // ★★★ 高周期趋势指标句柄 ★★★
 int g_trend_ma_handle = INVALID_HANDLE;
 //+------------------------------------------------------------------+
-//| 根据高周期趋势确定方向                                              |
+//| 根据高周期趋势确定方向（方案一：连续确认 + 斜率过滤）               |
 //+------------------------------------------------------------------+
 ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
 {
@@ -90,24 +94,61 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
       Print("【趋势判断】MA句柄无效，使用备用方向");
       return InitialDirection;
    }
+   
+   // 多取几根，保证有足够数据
+   int needBars = MathMax(TrendConfirmBars + 5, 10);
    double ma[];
    ArraySetAsSeries(ma, true);
-   if(CopyBuffer(g_trend_ma_handle, 0, 0, 3, ma) < 3)
+   if(CopyBuffer(g_trend_ma_handle, 0, 0, needBars, ma) < needBars)
    {
       Print("【趋势判断】复制MA缓冲失败，使用备用方向");
       return InitialDirection;
    }
-   // 使用最近已收盘K线的收盘价与MA比较（更稳定）
-   double close1 = iClose(_Symbol, HigherTF, 1);
-   if(close1 <= 0)
+   
+   // 检查连续确认根数的收盘价
+   bool allAbove = true;
+   bool allBelow = true;
+   
+   for(int i = 1; i <= TrendConfirmBars; i++)
    {
-      Print("【趋势判断】获取高周期收盘价失败，使用备用方向");
+      double close_i = iClose(_Symbol, HigherTF, i);
+      if(close_i <= 0.0)
+      {
+         Print("【趋势判断】获取高周期收盘价失败，使用备用方向");
+         return InitialDirection;
+      }
+      
+      if(close_i <= ma[i]) allAbove = false;
+      if(close_i >= ma[i]) allBelow = false;
+   }
+   
+   // MA斜率（最近几根的变化，单位：价格）
+   double maSlope = ma[1] - ma[TrendConfirmBars + 2];   // 正数向上，负数向下
+   double minSlope = TrendMinSlopePts * _Point;         // 转换为价格
+   
+   ENUM_INIT_DIRECTION dir;
+   
+   if(allAbove && maSlope > minSlope)
+   {
+      dir = DIR_LONG;
+   }
+   else if(allBelow && maSlope < -minSlope)
+   {
+      dir = DIR_SHORT;
+   }
+   else
+   {
+      // 震荡或方向不明确 → 使用备用方向
+      PrintFormat("【趋势判断】高周期震荡或不明确（连续确认失败或斜率不足），使用备用方向:%s",
+                  (InitialDirection == DIR_LONG ? "做多" : "做空"));
       return InitialDirection;
    }
-   ENUM_INIT_DIRECTION dir = (close1 > ma[1]) ? DIR_LONG : DIR_SHORT;
-   PrintFormat("【高周期趋势】TF:%s  MA(%.0f):%.5f  收盘价:%.5f → 方向:%s",
-               EnumToString(HigherTF), (double)TrendMAPeriod, ma[1], close1,
+   
+   PrintFormat("【高周期趋势】TF:%s  MA:%.5f  收盘:%.5f  斜率:%.5f  连续%d根确认 → 方向:%s",
+               EnumToString(HigherTF), ma[1], iClose(_Symbol, HigherTF, 1),
+               maSlope / _Point, TrendConfirmBars,
                (dir == DIR_LONG ? "做多" : "做空"));
+               
    return dir;
 }
 //+------------------------------------------------------------------+
@@ -132,10 +173,10 @@ int OnInit()
    // ★★★ 第一次下单方向由高周期趋势决定 ★★★
    g_currentDirection = GetHigherTFTrendDirection();
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v3.3.0【移动止损 + 逆势收紧移动止盈 + 锁定加仓 + 止损后立即翻仓】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.2【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    else
-      PrintFormat("EA启动 v3.3.0【移动止损 + 逆势收紧移动止盈 + 锁定加仓 + 止损后立即翻仓】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.2【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    return INIT_SUCCEEDED;
 }
@@ -563,6 +604,14 @@ void ExecuteReverseOrder()
 void ExecuteScaleInOrder(long posType)
 {
    if(!EnableScaleIn || g_scaled_in || LotScaleIn <= 0.0) return;
+   
+   // ★新增：账户余额必须达到配置值才允许加仓
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(MinBalanceForScaleIn > 0.0 && currentBalance < MinBalanceForScaleIn)
+   {
+      PrintFormat("【加仓跳过】账户余额 %.2f < 配置阈值 %.2f，本次不加仓", currentBalance, MinBalanceForScaleIn);
+      return;
+   }
    
    SetTradeFillingMode();
    MqlTick tick;
