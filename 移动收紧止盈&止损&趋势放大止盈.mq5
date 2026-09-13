@@ -5,22 +5,32 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "3.1.3"
+#property version   "3.2.0"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
+
 //===== 兼容常量定义 =====
 #define INVALID_POSITION_ID 0
 #define INVALID_ORDER_TICKET 0
+
 //===== 初始方向枚举 =====
 enum ENUM_INIT_DIRECTION
 {
    DIR_SHORT = 0,  // 初始做空
    DIR_LONG  = 1   // 初始做多
 };
+
 //===== 外部参数 =====
 input ulong   InpMagicNumber     = 888151;  // EA魔术码(用于区分订单)
-input ENUM_INIT_DIRECTION InitialDirection = DIR_SHORT; // 初始方向
+input ENUM_INIT_DIRECTION InitialDirection = DIR_SHORT; // 备用初始方向（仅当高周期趋势计算失败时使用）
+
+// ★★★ 高周期趋势参数（决定第一次开仓方向）★★★
+input ENUM_TIMEFRAMES HigherTF       = PERIOD_H1;   // 高周期时间框
+input int             TrendMAPeriod  = 50;          // 趋势MA周期
+input ENUM_MA_METHOD  TrendMAMethod  = MODE_EMA;    // 趋势MA方法
+input ENUM_APPLIED_PRICE TrendPrice  = PRICE_CLOSE; // 应用价格
+
 input double LotShort           = 0.01;     // 初始做空手数
 input double LotLong            = 0.01;     // 初始做多手数
 input double LotLongReverse     = 0.01;     // 做空止损反向多单手数
@@ -37,11 +47,13 @@ input int    CancelDelaySec     = 5;        // 延迟撤单秒数（已基本不
 input double TargetNetProfit    = 500;  // 目标净值(达到后全部平仓并停止)
 input double MaxDrawdownPct     = 50.0;     // 最大回撤率(%)，达到后终止EA并清仓
 input bool   ReverseDirectionAfterSL = true; // 初始单止损 + 反向单止盈后，是否反转方向
+
 //===== 隔夜库存费规避参数 =====
 input bool   AvoidSwapWednesdayOnly = false; // 是否仅在周三深夜规避库存费
 input int    AvoidSwapBeforeMin     = 10;    // 距离扣除库存费前多少分钟开始扫描
 input int    AvoidSwapAfterMin      = 10;    // 扣除库存费后恢复时间(分钟)
 input bool   EnableWeekendTrading   = false; // 是否开启周末定时开仓
+
 //===== 顺序移动止盈放大=====
 input double TrailProfitTrigger =18;    // 放大止盈触发浮盈阀值USD，达到后锁定利润
 input double TrailFactor = 1.3;             // 顺势移动止盈启动倍数(触发阀值*1.3开启顺势追踪)
@@ -60,10 +72,12 @@ bool     g_monitoring_reverse_position = false;
 datetime g_pending_reverse_check_time = 0;
 double   g_reverse_tp_price = 0.0;
 double   g_reverse_sl_price = 0.0;
+
 //===== 虚拟止损/止盈（本地记录）=====
 double   g_virtual_sl_price = 0.0;
 double   g_virtual_tp_price = 0.0;
 bool     g_last_close_was_tp = false;
+
 // ★★★ 库存费前盈利平仓后，过了窗口按原方向重新开仓 ★★★
 bool                 g_need_reopen_after_swap = false;
 ENUM_INIT_DIRECTION  g_reopen_direction       = DIR_SHORT;
@@ -73,32 +87,92 @@ bool   g_use_trailing_tp_mode = false;       // 是否启用顺势移动止盈�
 double g_trail_tp_base_profit = 0.0;         // 触发放大止盈的基准浮盈
 double g_trail_activation_price = 0.0;       // ★新增：开启顺势模式时的价格（用于计算额外利润）
 
+// ★★★ 高周期趋势指标句柄 ★★★
+int g_trend_ma_handle = INVALID_HANDLE;
+
+//+------------------------------------------------------------------+
+//| 根据高周期趋势确定方向                                              |
+//+------------------------------------------------------------------+
+ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
+{
+   if(g_trend_ma_handle == INVALID_HANDLE)
+   {
+      Print("【趋势判断】MA句柄无效，使用备用方向");
+      return InitialDirection;
+   }
+
+   double ma[];
+   ArraySetAsSeries(ma, true);
+   if(CopyBuffer(g_trend_ma_handle, 0, 0, 3, ma) < 3)
+   {
+      Print("【趋势判断】复制MA缓冲失败，使用备用方向");
+      return InitialDirection;
+   }
+
+   // 使用最近已收盘K线的收盘价与MA比较（更稳定）
+   double close1 = iClose(_Symbol, HigherTF, 1);
+   if(close1 <= 0)
+   {
+      Print("【趋势判断】获取高周期收盘价失败，使用备用方向");
+      return InitialDirection;
+   }
+
+   ENUM_INIT_DIRECTION dir = (close1 > ma[1]) ? DIR_LONG : DIR_SHORT;
+   PrintFormat("【高周期趋势】TF:%s  MA(%.0f):%.5f  收盘价:%.5f → 方向:%s",
+               EnumToString(HigherTF), (double)TrendMAPeriod, ma[1], close1,
+               (dir == DIR_LONG ? "做多" : "做空"));
+   return dir;
+}
+
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
    trade.SetExpertMagicNumber(InpMagicNumber);
+
+   // 创建高周期趋势MA句柄
+   g_trend_ma_handle = iMA(_Symbol, HigherTF, TrendMAPeriod, 0, TrendMAMethod, TrendPrice);
+   if(g_trend_ma_handle == INVALID_HANDLE)
+   {
+      Print("【错误】创建高周期MA失败！错误码：", GetLastError());
+      return INIT_FAILED;
+   }
+
    if(!EventSetTimer(1))
    {
       Print("定时器创建失败！错误码：", GetLastError());
       return INIT_PARAMETERS_INCORRECT;
    }
+
    g_nextTriggerTime = CalculateNextTriggerTime(TimeTradeServer());
-   g_currentDirection = InitialDirection;
+
+   // ★★★ 第一次下单方向由高周期趋势决定 ★★★
+   g_currentDirection = GetHigherTFTrendDirection();
+
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v3.3.0【移动止损 + 逆势收紧移动止盈(带±5保护) + 止损后立即翻仓】规则：定时自动做空 | 间隔:%d分钟 | 目标净值:%.2f", IntervalMinutes, TargetNetProfit);
+      PrintFormat("EA启动 v3.2.0【移动止损 + 逆势收紧移动止盈 + 止损后立即翻仓】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
+                  IntervalMinutes, TargetNetProfit);
    else
-      PrintFormat("EA启动 v3.3.0【移动止损 + 逆势收紧移动止盈(带±5保护) + 止损后立即翻仓】规则：定时自动做多 | 间隔:%d分钟 | 目标净值:%.2f", IntervalMinutes, TargetNetProfit);
+      PrintFormat("EA启动 v3.2.0【移动止损 + 逆势收紧移动止盈 + 止损后立即翻仓】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
+                  IntervalMinutes, TargetNetProfit);
+
    return INIT_SUCCEEDED;
 }
+
 //+------------------------------------------------------------------+
 //| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   if(g_trend_ma_handle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_trend_ma_handle);
+      g_trend_ma_handle = INVALID_HANDLE;
+   }
 }
+
 //+------------------------------------------------------------------+
 //| 辅助函数：提取商品的基础名称                                       |
 //+------------------------------------------------------------------+
@@ -110,10 +184,12 @@ string GetBaseSymbol(string fullSymbol)
    if(StringLen(fullSymbol) > 6) return StringSubstr(fullSymbol, 0, 6);
    return fullSymbol;
 }
+
 bool IsSameBaseSymbol(string symbolA, string symbolB)
 {
    return (GetBaseSymbol(symbolA) == GetBaseSymbol(symbolB));
 }
+
 //+------------------------------------------------------------------+
 //| 获取当前魔术码最新的持仓 ID                                        |
 //+------------------------------------------------------------------+
@@ -133,6 +209,7 @@ ulong GetLatestPositionID()
    }
    return INVALID_POSITION_ID;
 }
+
 //+------------------------------------------------------------------+
 //| 计算下一个触发点                                                   |
 //+------------------------------------------------------------------+
@@ -159,6 +236,7 @@ datetime CalculateNextTriggerTime(datetime fromTime)
    }
    return candidate;
 }
+
 //===== 防重复校验 =====
 bool CheckHasAnyPendingOrder()
 {
@@ -178,6 +256,7 @@ bool CheckHasAnyPendingOrder()
    }
    return false;
 }
+
 bool CheckHasAnyPosition()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -196,6 +275,7 @@ bool CheckHasAnyPosition()
    }
    return false;
 }
+
 void SetTradeFillingMode()
 {
    long filling = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
@@ -203,6 +283,7 @@ void SetTradeFillingMode()
    else if((filling & ORDER_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
    else                                        trade.SetTypeFilling(ORDER_FILLING_RETURN);
 }
+
 //+------------------------------------------------------------------+
 //| 回撤止损：停止EA并清仓                                             |
 //+------------------------------------------------------------------+
@@ -241,6 +322,7 @@ void StopEAAndClean()
    }
    PrintFormat("【回撤保护】已平仓 %d 个仓位，已撤销 %d 个委托。EA已停止运行。", closedCount, deletedCount);
 }
+
 //+------------------------------------------------------------------+
 //| 计算并检查最大回撤                                                 |
 //+------------------------------------------------------------------+
@@ -267,6 +349,7 @@ void CalculateMaxDrawdown()
       StopEAAndClean();
    }
 }
+
 //+------------------------------------------------------------------+
 //| 检查目标净值                                                       |
 //+------------------------------------------------------------------+
@@ -301,6 +384,7 @@ void CheckAndCloseAllPositions()
       g_target_reached = true;
    }
 }
+
 //+------------------------------------------------------------------+
 //| 安全撤销关联的反向挂单（保留兼容）                                 |
 //+------------------------------------------------------------------+
@@ -344,6 +428,7 @@ void CancelAssociatedPendingOrder()
    if(extraDeleted > 0)
       PrintFormat("【安全撤单】共额外清理 %d 个残留挂单", extraDeleted);
 }
+
 //+------------------------------------------------------------------+
 //| 判断指定持仓是否以止盈方式平仓                                     |
 //+------------------------------------------------------------------+
@@ -418,6 +503,7 @@ bool IsPositionClosedByTP(ulong position_id)
    PrintFormat("【平仓判定】PositionID:%I64u 多次重试仍未找到OUT成交 → 按非止盈处理", position_id);
    return false;
 }
+
 //+------------------------------------------------------------------+
 //| 开反向翻仓单（初始单止损后立即调用）                               |
 //+------------------------------------------------------------------+
@@ -505,6 +591,7 @@ void ExecuteReverseOrder()
       }
    }
 }
+
 //+------------------------------------------------------------------+
 //| 下单逻辑（初始单）——不再挂反向单                                   |
 //+------------------------------------------------------------------+
@@ -540,6 +627,7 @@ void ExecuteShortOrder()
                   bid, trade.ResultRetcode(), trade.ResultRetcodeDescription());
    }
 }
+
 void ExecuteLongOrder()
 {
    ResetTrackTPState(); // 重置止盈模式状态
@@ -572,6 +660,7 @@ void ExecuteLongOrder()
                   ask, trade.ResultRetcode(), trade.ResultRetcodeDescription());
    }
 }
+
 //+------------------------------------------------------------------+
 //| 【核心】虚拟移动止损 + 双模式止盈：前期逆势收紧，达标后切换顺势放大移动止盈   |
 //+------------------------------------------------------------------+
@@ -641,14 +730,12 @@ if(BreakEvenProfit > 0.0)
 // ================================================================
          double trailSL = g_monitoring_reverse_position ? REV_SL_USD : SL_USD;
          double trailTP = g_monitoring_reverse_position ? REV_TP_USD : TP_USD;
-
          // 计算当前浮盈（USD价格空间，不是账户盈亏）
          double priceProfit = 0.0;
          if(posType == POSITION_TYPE_BUY)
              priceProfit = currentPrice - openPrice;
          else
              priceProfit = openPrice - currentPrice;
-
                   //==== 双模式止盈逻辑：【逆势收紧】→达标切换【锁额外利润顺势放大】====
          if(!g_use_trailing_tp_mode)
          {
@@ -794,7 +881,6 @@ if(BreakEvenProfit > 0.0)
                  }
              }
          }
-
          // 检查是否触发止盈或止损
          bool hitTP = false;
          bool hitSL = false;
@@ -1002,6 +1088,7 @@ void MonitorPositionStatus()
    g_virtual_tp_price = 0.0;
    g_last_close_was_tp = false;
 }
+
 //+------------------------------------------------------------------+
 //| 库存费避让相关函数                                                 |
 //+------------------------------------------------------------------+
@@ -1028,6 +1115,7 @@ bool IsInSwapAvoidWindow(datetime serverTime)
       return false;
    }
 }
+
 bool IsInPreSwapWindow(datetime serverTime)
 {
    MqlDateTime dt;
@@ -1045,6 +1133,7 @@ bool IsInPreSwapWindow(datetime serverTime)
       return false;
    }
 }
+
 void ScanAndCloseProfitablePositions()
 {
    bool hasProfitable = false;
@@ -1107,6 +1196,7 @@ void ScanAndCloseProfitablePositions()
                   closedCount, deletedCount);
    }
 }
+
 bool HasSkipOpenSignal()
 {
    for(int i = OrdersTotal() - 1; i >= 0; i--)
@@ -1126,6 +1216,7 @@ bool HasSkipOpenSignal()
    }
    return false;
 }
+
 //+------------------------------------------------------------------+
 //| 定时器主逻辑                                                       |
 //+------------------------------------------------------------------+
