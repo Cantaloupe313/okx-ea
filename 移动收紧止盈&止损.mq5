@@ -424,7 +424,7 @@ void ExecuteReverseOrder()
    {
       // 初始做空 → 反向做多
       const double ask = tick.ask;
-      if(trade.Buy(LotLongReverse, _Symbol, ask, 0, 0, "Reverse"))
+      if(trade.Buy(LotLongReverse, _Symbol, ask, 0, 0, ""))
       {
          ulong deal_ticket = trade.ResultDeal();
          g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ?
@@ -461,7 +461,7 @@ void ExecuteReverseOrder()
    {
       // 初始做多 → 反向做空
       const double bid = tick.bid;
-      if(trade.Sell(LotShortReverse, _Symbol, bid, 0, 0, "Reverse"))
+      if(trade.Sell(LotShortReverse, _Symbol, bid, 0, 0, ""))
       {
          ulong deal_ticket = trade.ResultDeal();
          g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ?
