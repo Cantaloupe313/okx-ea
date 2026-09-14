@@ -27,8 +27,8 @@ input int             TrendMAPeriod  = 50;          // 趋势MA周期
 input ENUM_MA_METHOD  TrendMAMethod  = MODE_EMA;    // 趋势MA方法
 input ENUM_APPLIED_PRICE TrendPrice  = PRICE_CLOSE; // 应用价格
 // ★新增：趋势过滤参数
-input int    TrendConfirmBars   = 3;     // 连续确认K线根数（建议2~4）
-input double TrendMinSlopePts   = 50.0;  // MA最小斜率（点数，过滤横盘，可按品种调整）
+input int    TrendConfirmBars   = 2;     // 连续确认K线根数（建议2~4）
+input double TrendMinSlopePts   = 50.0;  // MA最小斜率（点数，过滤横盘，可按品种调整，30~50（根据品种点值调整，黄金可适当加大）
 input double LotShort           = 0.01;     // 初始做空手数
 input double LotLong            = 0.01;     // 初始做多手数
 input double LotLongReverse     = 0.01;     // 做空止损反向多单手数
@@ -85,7 +85,7 @@ bool   g_scaled_in = false;                  // ★新增：是否已在本轮�
 // ★★★ 高周期趋势指标句柄 ★★★
 int g_trend_ma_handle = INVALID_HANDLE;
 //+------------------------------------------------------------------+
-//| 根据高周期趋势确定方向（方案一：连续确认 + 斜率过滤）               |
+//| 根据高周期趋势确定方向（更灵敏版：近期确认 + 斜率 + 当前价过滤）   |
 //+------------------------------------------------------------------+
 ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
 {
@@ -95,8 +95,8 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
       return InitialDirection;
    }
    
-   // 多取几根，保证有足够数据
-   int needBars = MathMax(TrendConfirmBars + 5, 10);
+   // 多取几根保证数据充足
+   int needBars = MathMax(TrendConfirmBars + 8, 15);
    double ma[];
    ArraySetAsSeries(ma, true);
    if(CopyBuffer(g_trend_ma_handle, 0, 0, needBars, ma) < needBars)
@@ -105,47 +105,60 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
       return InitialDirection;
    }
    
-   // 检查连续确认根数的收盘价
-   bool allAbove = true;
-   bool allBelow = true;
-   
-   for(int i = 1; i <= TrendConfirmBars; i++)
+   // 当前高周期收盘价（已收盘的最近一根）
+   double close1 = iClose(_Symbol, HigherTF, 1);
+   double close2 = iClose(_Symbol, HigherTF, 2);
+   if(close1 <= 0.0 || close2 <= 0.0)
    {
-      double close_i = iClose(_Symbol, HigherTF, i);
-      if(close_i <= 0.0)
-      {
-         Print("【趋势判断】获取高周期收盘价失败，使用备用方向");
-         return InitialDirection;
-      }
-      
-      if(close_i <= ma[i]) allAbove = false;
-      if(close_i >= ma[i]) allBelow = false;
+      Print("【趋势判断】获取高周期收盘价失败，使用备用方向");
+      return InitialDirection;
    }
    
-   // MA斜率（最近几根的变化，单位：价格）
-   double maSlope = ma[1] - ma[TrendConfirmBars + 2];   // 正数向上，负数向下
-   double minSlope = TrendMinSlopePts * _Point;         // 转换为价格
+   // ===== 1. 斜率（更短窗口，更灵敏）=====
+   // 用最近 3~4 根MA变化，比原来短很多
+   int slopeBars = MathMax(3, TrendConfirmBars);
+   double maSlope = ma[1] - ma[1 + slopeBars];
+   double minSlope = TrendMinSlopePts * _Point;
+   
+   // ===== 2. 近期确认（只要求最近1~2根，不再强制全部连续）=====
+   bool recentBullish = (close1 > ma[1]) && (close2 > ma[2] || close1 > ma[1] * 1.0001); // 最近一根强确认，前一根可宽松
+   bool recentBearish = (close1 < ma[1]) && (close2 < ma[2] || close1 < ma[1] * 0.9999);
+   
+   // 如果用户把 TrendConfirmBars 设为1，就只看最近一根
+   if(TrendConfirmBars <= 1)
+   {
+      recentBullish = (close1 > ma[1]);
+      recentBearish = (close1 < ma[1]);
+   }
+   
+   // ===== 3. 当前价位置过滤（再加一层保险）=====
+   // 用当前形成中的高周期K线收盘价（实时性最好）
+   double close0 = iClose(_Symbol, HigherTF, 0);
+   bool currentAbove = (close0 > ma[0]);
+   bool currentBelow = (close0 < ma[0]);
    
    ENUM_INIT_DIRECTION dir;
    
-   if(allAbove && maSlope > minSlope)
+   // 做多条件：近期偏多 + 斜率向上超过阈值 + 当前价仍在MA上方
+   if(recentBullish && maSlope > minSlope && currentAbove)
    {
       dir = DIR_LONG;
    }
-   else if(allBelow && maSlope < -minSlope)
+   // 做空条件：近期偏空 + 斜率向下超过阈值 + 当前价仍在MA下方
+   else if(recentBearish && maSlope < -minSlope && currentBelow)
    {
       dir = DIR_SHORT;
    }
    else
    {
-      // 震荡或方向不明确 → 使用备用方向
-      PrintFormat("【趋势判断】高周期震荡或不明确（连续确认失败或斜率不足），使用备用方向:%s",
+      // 震荡或不明确 → 使用备用方向
+      PrintFormat("【趋势判断】高周期震荡或不明确（确认不足或斜率不足），使用备用方向:%s",
                   (InitialDirection == DIR_LONG ? "做多" : "做空"));
       return InitialDirection;
    }
    
-   PrintFormat("【高周期趋势】TF:%s  MA:%.5f  收盘:%.5f  斜率:%.5f  连续%d根确认 → 方向:%s",
-               EnumToString(HigherTF), ma[1], iClose(_Symbol, HigherTF, 1),
+   PrintFormat("【高周期趋势-灵敏版】TF:%s  MA[1]:%.5f  收盘[1]:%.5f  斜率:%.1f点  确认根数:%d → 方向:%s",
+               EnumToString(HigherTF), ma[1], close1,
                maSlope / _Point, TrendConfirmBars,
                (dir == DIR_LONG ? "做多" : "做空"));
                
