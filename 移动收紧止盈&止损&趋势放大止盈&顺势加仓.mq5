@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "3.3.2"
+#property version   "3.3.3"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -48,6 +48,7 @@ input int    CancelDelaySec     = 5;        // 延迟撤单秒数（已基本不
 input double TargetNetProfit    = 500;  // 目标净值(达到后全部平仓并停止)
 input double MaxDrawdownPct     = 50.0;     // 最大回撤率(%)，达到后终止EA并清仓
 input bool   ReverseDirectionAfterSL = true; // 初始单止损 + 反向单止盈后，是否反转方向
+input bool   UseTrendFilterOnReverse = true; // 反转方向时启用高周期趋势过滤（仅当拟反转方向与趋势一致时才真正反转）
 //===== 隔夜库存费规避参数 =====
 input bool   AvoidSwapWednesdayOnly = false; // 是否仅在周三深夜规避库存费
 input int    AvoidSwapBeforeMin     = 10;    // 距离扣除库存费前多少分钟开始扫描
@@ -186,10 +187,10 @@ int OnInit()
    // ★★★ 第一次下单方向由高周期趋势决定 ★★★
    g_currentDirection = GetHigherTFTrendDirection();
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v3.3.2【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.3【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    else
-      PrintFormat("EA启动 v3.3.2【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.3【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    return INIT_SUCCEEDED;
 }
@@ -1134,9 +1135,34 @@ void MonitorPositionStatus()
       bool closedByTP = g_last_close_was_tp || IsPositionClosedByTP(g_monitor_position_id);
       if(closedByTP && ReverseDirectionAfterSL)
       {
-         g_currentDirection = (g_currentDirection == DIR_SHORT) ? DIR_LONG : DIR_SHORT;
-         PrintFormat("【方向更新】初始单止损 + 反向单止盈 → 已反转方向为: %s",
-                     (g_currentDirection == DIR_SHORT) ? "做空" : "做多");
+         // 拟反转后的方向
+         ENUM_INIT_DIRECTION proposedDir = (g_currentDirection == DIR_SHORT) ? DIR_LONG : DIR_SHORT;
+         
+         if(UseTrendFilterOnReverse)
+         {
+            // 高周期趋势过滤：只有拟反转方向与高周期趋势一致时才真正反转
+            ENUM_INIT_DIRECTION trendDir = GetHigherTFTrendDirection();
+            if(proposedDir == trendDir)
+            {
+               g_currentDirection = proposedDir;
+               PrintFormat("【方向更新+趋势过滤】初始单止损+反向单止盈 → 拟反转方向与高周期趋势一致，已反转方向为: %s",
+                           (g_currentDirection == DIR_SHORT) ? "做空" : "做多");
+            }
+            else
+            {
+               PrintFormat("【方向保持+趋势过滤】初始单止损+反向单止盈 → 拟反转方向(%s)与高周期趋势(%s)不一致，保持原方向: %s",
+                           (proposedDir == DIR_SHORT) ? "做空" : "做多",
+                           (trendDir == DIR_SHORT) ? "做空" : "做多",
+                           (g_currentDirection == DIR_SHORT) ? "做空" : "做多");
+            }
+         }
+         else
+         {
+            // 不启用趋势过滤，直接反转
+            g_currentDirection = proposedDir;
+            PrintFormat("【方向更新】初始单止损 + 反向单止盈 → 已反转方向为: %s",
+                        (g_currentDirection == DIR_SHORT) ? "做空" : "做多");
+         }
       }
       else
       {
