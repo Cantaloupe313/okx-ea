@@ -6,7 +6,7 @@
 //     3.3.6只要浮盈大于等于4尽早锁定利润
 //     3.3.7顺势放大止盈调整移动锁利模式&初始下单方向优先面板选择的下单，其次高周期趋势决定方向
 //。   3.3.8修复高周期趋势决定开仓方向不准确问题
-//。   3.3.9加仓单独立管理，包含逆势收紧止盈，移动止损，早期锁利，保本损，顺势放大移动止盈
+//。   3.3.9加仓单独立管理，包含逆势收紧止盈，移动止损，早期锁利，保本损，顺势放大移动止盈&修复若干问题
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
@@ -99,11 +99,12 @@ bool                 g_need_reopen_after_swap = false;
 ENUM_INIT_DIRECTION  g_reopen_direction       = DIR_SHORT;
 bool   g_scaled_in = false;                  // ★新增：是否已在本轮锁定时加仓
 bool   g_trail_tp_triggered = false;         // 是否已首次达到放大止盈触发值
-ulong  g_scale_in_position_id = INVALID_POSITION_ID;
-bool   g_scale_in_is_reverse_position = false;
-double g_scale_virtual_sl_price = 0.0;
-double g_scale_virtual_tp_price = 0.0;
-bool   g_scale_trail_tp_triggered = false;
+bool   g_scale_in_monitoring_error = false;
+ulong  g_scale_in_position_ids[];
+bool   g_scale_in_reverse_flags[];
+double g_scale_virtual_sl_prices[];
+double g_scale_virtual_tp_prices[];
+bool   g_scale_trail_tp_triggered_flags[];
 // ★★★ 高周期趋势指标句柄 ★★★
 int g_trend_ma_handle = INVALID_HANDLE;
 //+------------------------------------------------------------------+
@@ -249,10 +250,10 @@ int OnInit()
                   (g_currentDirection == DIR_LONG ? "做多" : "做空"));
    }
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v3.3.7【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.9【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    else
-      PrintFormat("EA启动 v3.3.7【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.9【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    return INIT_SUCCEEDED;
 }
@@ -286,21 +287,32 @@ bool IsSameBaseSymbol(string symbolA, string symbolB)
 //+------------------------------------------------------------------+
 //| 获取当前魔术码最新的持仓 ID                                        |
 //+------------------------------------------------------------------+
-ulong GetLatestPositionID()
+ulong GetLatestPositionID(long expectedType = -1)
 {
+   ulong latestPositionId = INVALID_POSITION_ID;
+   long latestPositionTime = -1;
+   ulong latestPositionTicket = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong posTicket = PositionGetTicket(i);
       if(posTicket > 0 && PositionSelectByTicket(posTicket))
       {
          if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
-            PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+            PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
+            (expectedType < 0 || PositionGetInteger(POSITION_TYPE) == expectedType))
          {
-            return PositionGetInteger(POSITION_IDENTIFIER);
+            long positionTime = PositionGetInteger(POSITION_TIME_MSC);
+            if(positionTime > latestPositionTime ||
+               (positionTime == latestPositionTime && posTicket > latestPositionTicket))
+            {
+               latestPositionTime = positionTime;
+               latestPositionTicket = posTicket;
+               latestPositionId = PositionGetInteger(POSITION_IDENTIFIER);
+            }
          }
       }
    }
-   return INVALID_POSITION_ID;
+   return latestPositionId;
 }
 //+------------------------------------------------------------------+
 //| 计算下一个触发点                                                   |
@@ -608,7 +620,7 @@ void ExecuteReverseOrder()
       {
          ulong deal_ticket = trade.ResultDeal();
          g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ?
-                                 HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID();
+                                 HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID(POSITION_TYPE_BUY);
          g_monitoring_reverse_position = true;
          g_last_close_was_tp = false;
          g_reverse_order_ticket = INVALID_ORDER_TICKET;
@@ -645,7 +657,7 @@ void ExecuteReverseOrder()
       {
          ulong deal_ticket = trade.ResultDeal();
          g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ?
-                                 HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID();
+                                 HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID(POSITION_TYPE_SELL);
          g_monitoring_reverse_position = true;
          g_last_close_was_tp = false;
          g_reverse_order_ticket = INVALID_ORDER_TICKET;
@@ -677,9 +689,15 @@ void ExecuteReverseOrder()
 //+------------------------------------------------------------------+
 //| ★新增：锁定利润时同向加仓（跟随初始单逻辑）                        |
 //+------------------------------------------------------------------+
+void MarkScaleInMonitoringError()
+{
+   Print("【加仓监控错误】无法建立可靠的加仓持仓监控，停止后续加仓；现有仓位继续运行");
+   g_scale_in_monitoring_error = true;
+}
+
 void ExecuteScaleInOrder(long posType)
 {
-   if(!EnableScaleIn || g_scaled_in || LotScaleIn <= 0.0) return;
+   if(!EnableScaleIn || g_scaled_in || g_scale_in_monitoring_error || LotScaleIn <= 0.0) return;
    
    // ★新增：账户余额必须达到配置值才允许加仓
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -731,8 +749,6 @@ void ExecuteScaleInOrder(long posType)
       ulong dealTicket = trade.ResultDeal();
       positionId = (dealTicket > 0 && HistoryDealSelect(dealTicket)) ?
                    HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID) : INVALID_POSITION_ID;
-      if(positionId == INVALID_POSITION_ID)
-         positionId = GetLatestPositionID();
 
       double openPrice = 0.0;
       for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -747,20 +763,47 @@ void ExecuteScaleInOrder(long posType)
       }
       if(openPrice <= 0.0)
       {
-         Print("【加仓错误】无法获取加仓持仓价格，放弃独立加仓监控");
-         g_scaled_in = false;
+         if(positionId != INVALID_POSITION_ID)
+         {
+            ulong unmanagedTicket = 0;
+            for(int i = PositionsTotal() - 1; i >= 0; i--)
+            {
+               ulong ticket = PositionGetTicket(i);
+               if(ticket > 0 && PositionSelectByTicket(ticket) &&
+                  PositionGetString(POSITION_SYMBOL) == _Symbol &&
+                  PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
+                  PositionGetInteger(POSITION_TYPE) == posType &&
+                  PositionGetInteger(POSITION_IDENTIFIER) == (long)positionId)
+               {
+                  unmanagedTicket = ticket;
+                  break;
+               }
+            }
+
+            if(unmanagedTicket > 0 && trade.PositionClose(unmanagedTicket))
+            {
+               PrintFormat("【加仓保护】无法获取开仓价，已平仓异常加仓 Ticket:%I64u", unmanagedTicket);
+               g_scaled_in = false;
+               return;
+            }
+         }
+
+         PrintFormat("【加仓保护失败】无法建立独立监控，持仓ID:%I64u", positionId);
+         g_scaled_in = true;
+         MarkScaleInMonitoringError();
          return;
       }
 
-      g_scale_in_position_id = positionId;
-      g_scale_in_is_reverse_position = g_monitoring_reverse_position;
-      g_scale_virtual_sl_price = NormalizeDouble(
-         openPrice + (posType == POSITION_TYPE_BUY ? -SL_USD : SL_USD), _Digits);
-      g_scale_virtual_tp_price = NormalizeDouble(
-         openPrice + (posType == POSITION_TYPE_BUY ? TP_USD : -TP_USD), _Digits);
-      g_scale_trail_tp_triggered = false;
+      bool isReverseScaleIn = g_monitoring_reverse_position;
+      double scaleSL = isReverseScaleIn ? REV_SL_USD : SL_USD;
+      double scaleTP = isReverseScaleIn ? REV_TP_USD : TP_USD;
+      double scaleVirtualSL = NormalizeDouble(
+         openPrice + (posType == POSITION_TYPE_BUY ? -scaleSL : scaleSL), _Digits);
+      double scaleVirtualTP = NormalizeDouble(
+         openPrice + (posType == POSITION_TYPE_BUY ? scaleTP : -scaleTP), _Digits);
+      TrackScaleInPosition(positionId, isReverseScaleIn, scaleVirtualSL, scaleVirtualTP);
       PrintFormat("【锁定加仓完成】持仓ID:%I64u，已启用独立移动止损、逆势收紧止盈、保本损和顺势移动止盈",
-                  g_scale_in_position_id);
+                  positionId);
    }
 }
 //+------------------------------------------------------------------+
@@ -783,7 +826,7 @@ void ExecuteShortOrder()
    {
       ulong deal_ticket = trade.ResultDeal();
       g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ?
-                              HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID();
+                  HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID(POSITION_TYPE_SELL);
       g_virtual_sl_price = virtual_sl;
       g_virtual_tp_price = virtual_tp;
       g_monitoring_reverse_position = false;
@@ -815,7 +858,7 @@ void ExecuteLongOrder()
    {
       ulong deal_ticket = trade.ResultDeal();
       g_monitor_position_id = (deal_ticket > 0 && HistoryDealSelect(deal_ticket)) ?
-                              HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID();
+                  HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) : GetLatestPositionID(POSITION_TYPE_BUY);
       g_virtual_sl_price = virtual_sl;
       g_virtual_tp_price = virtual_tp;
       g_monitoring_reverse_position = false;
@@ -830,53 +873,92 @@ void ExecuteLongOrder()
                   ask, trade.ResultRetcode(), trade.ResultRetcodeDescription());
    }
 }
-void ResetScaleInState()
+bool IsTrackedScaleInPosition(ulong positionId)
 {
-   g_scale_in_position_id = INVALID_POSITION_ID;
-   g_scale_in_is_reverse_position = false;
-   g_scale_virtual_sl_price = 0.0;
-   g_scale_virtual_tp_price = 0.0;
-   g_scale_trail_tp_triggered = false;
+   for(int i = 0; i < ArraySize(g_scale_in_position_ids); i++)
+   {
+      if(g_scale_in_position_ids[i] == positionId)
+         return true;
+   }
+   return false;
+}
+
+void TrackScaleInPosition(ulong positionId, bool isReverse, double virtualSL, double virtualTP)
+{
+   if(positionId == INVALID_POSITION_ID || IsTrackedScaleInPosition(positionId))
+      return;
+
+   int count = ArraySize(g_scale_in_position_ids);
+   ArrayResize(g_scale_in_position_ids, count + 1);
+   ArrayResize(g_scale_in_reverse_flags, count + 1);
+   ArrayResize(g_scale_virtual_sl_prices, count + 1);
+   ArrayResize(g_scale_virtual_tp_prices, count + 1);
+   ArrayResize(g_scale_trail_tp_triggered_flags, count + 1);
+   g_scale_in_position_ids[count] = positionId;
+   g_scale_in_reverse_flags[count] = isReverse;
+   g_scale_virtual_sl_prices[count] = virtualSL;
+   g_scale_virtual_tp_prices[count] = virtualTP;
+   g_scale_trail_tp_triggered_flags[count] = false;
+}
+
+void UntrackScaleInPositionAt(int index)
+{
+   int lastIndex = ArraySize(g_scale_in_position_ids) - 1;
+   if(index < 0 || index > lastIndex)
+      return;
+   if(index != lastIndex)
+   {
+      g_scale_in_position_ids[index] = g_scale_in_position_ids[lastIndex];
+      g_scale_in_reverse_flags[index] = g_scale_in_reverse_flags[lastIndex];
+      g_scale_virtual_sl_prices[index] = g_scale_virtual_sl_prices[lastIndex];
+      g_scale_virtual_tp_prices[index] = g_scale_virtual_tp_prices[lastIndex];
+      g_scale_trail_tp_triggered_flags[index] = g_scale_trail_tp_triggered_flags[lastIndex];
+   }
+   ArrayResize(g_scale_in_position_ids, lastIndex);
+   ArrayResize(g_scale_in_reverse_flags, lastIndex);
+   ArrayResize(g_scale_virtual_sl_prices, lastIndex);
+   ArrayResize(g_scale_virtual_tp_prices, lastIndex);
+   ArrayResize(g_scale_trail_tp_triggered_flags, lastIndex);
 }
 
 bool ManageScaleInPosition()
 {
-   if(g_scale_in_position_id == INVALID_POSITION_ID)
-      return false;
-
-   ulong positionTicket = 0;
-   long positionType = -1;
-   double openPrice = 0.0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   for(int stateIndex = ArraySize(g_scale_in_position_ids) - 1; stateIndex >= 0; stateIndex--)
    {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket > 0 && PositionSelectByTicket(ticket) &&
-         PositionGetString(POSITION_SYMBOL) == _Symbol &&
-         PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
-         PositionGetInteger(POSITION_IDENTIFIER) == (long)g_scale_in_position_id)
+      ulong positionId = g_scale_in_position_ids[stateIndex];
+      ulong positionTicket = 0;
+      long positionType = -1;
+      double openPrice = 0.0;
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
-         positionTicket = ticket;
-         positionType = PositionGetInteger(POSITION_TYPE);
-         openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-         break;
+         ulong ticket = PositionGetTicket(i);
+         if(ticket > 0 && PositionSelectByTicket(ticket) &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
+            PositionGetInteger(POSITION_IDENTIFIER) == (long)positionId)
+         {
+            positionTicket = ticket;
+            positionType = PositionGetInteger(POSITION_TYPE);
+            openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            break;
+         }
       }
-   }
 
-   if(positionTicket == 0)
-   {
-      ResetScaleInState();
-      return false;
-   }
+      if(positionTicket == 0)
+      {
+         UntrackScaleInPositionAt(stateIndex);
+         continue;
+      }
 
-   double currentPrice = (positionType == POSITION_TYPE_BUY) ?
+      double currentPrice = (positionType == POSITION_TYPE_BUY) ?
                          SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                          SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double priceProfit = (positionType == POSITION_TYPE_BUY) ?
+      double priceProfit = (positionType == POSITION_TYPE_BUY) ?
                         currentPrice - openPrice : openPrice - currentPrice;
-   double trailSL = g_scale_in_is_reverse_position ? REV_SL_USD : SL_USD;
-   double trailTP = g_scale_in_is_reverse_position ? REV_TP_USD : TP_USD;
+      double trailSL = g_scale_in_reverse_flags[stateIndex] ? REV_SL_USD : SL_USD;
+      double trailTP = g_scale_in_reverse_flags[stateIndex] ? REV_TP_USD : TP_USD;
 
-   if(EarlyLockProfit > 0.0 && priceProfit >= EarlyLockProfit &&
+      if(EarlyLockProfit > 0.0 && priceProfit >= EarlyLockProfit &&
       priceProfit < TrailProfitTrigger)
    {
       if(positionType == POSITION_TYPE_BUY)
@@ -884,37 +966,37 @@ bool ManageScaleInPosition()
          double earlySL = NormalizeDouble(currentPrice - EarlyLockOffset, _Digits);
          double minEarlySL = NormalizeDouble(openPrice + 1.0, _Digits);
          if(earlySL < minEarlySL) earlySL = minEarlySL;
-         if(earlySL > g_scale_virtual_sl_price)
-            g_scale_virtual_sl_price = earlySL;
+         if(earlySL > g_scale_virtual_sl_prices[stateIndex])
+            g_scale_virtual_sl_prices[stateIndex] = earlySL;
       }
       else
       {
          double earlySL = NormalizeDouble(currentPrice + EarlyLockOffset, _Digits);
          double maxEarlySL = NormalizeDouble(openPrice - 1.0, _Digits);
          if(earlySL > maxEarlySL) earlySL = maxEarlySL;
-         if(earlySL < g_scale_virtual_sl_price || g_scale_virtual_sl_price <= 0.0)
-            g_scale_virtual_sl_price = earlySL;
+         if(earlySL < g_scale_virtual_sl_prices[stateIndex] || g_scale_virtual_sl_prices[stateIndex] <= 0.0)
+            g_scale_virtual_sl_prices[stateIndex] = earlySL;
       }
    }
 
-   if(BreakEvenProfit > 0.0)
+      if(BreakEvenProfit > 0.0)
    {
       if(positionType == POSITION_TYPE_BUY)
       {
          double bePrice = NormalizeDouble(openPrice + BreakEvenOffset, _Digits);
-         if(priceProfit >= BreakEvenProfit && g_scale_virtual_sl_price < bePrice)
-            g_scale_virtual_sl_price = bePrice;
+         if(priceProfit >= BreakEvenProfit && g_scale_virtual_sl_prices[stateIndex] < bePrice)
+            g_scale_virtual_sl_prices[stateIndex] = bePrice;
       }
       else
       {
          double bePrice = NormalizeDouble(openPrice - BreakEvenOffset, _Digits);
          if(priceProfit >= BreakEvenProfit &&
-            (g_scale_virtual_sl_price > bePrice || g_scale_virtual_sl_price <= 0.0))
-            g_scale_virtual_sl_price = bePrice;
+            (g_scale_virtual_sl_prices[stateIndex] > bePrice || g_scale_virtual_sl_prices[stateIndex] <= 0.0))
+            g_scale_virtual_sl_prices[stateIndex] = bePrice;
       }
    }
 
-   if(priceProfit < TrailProfitTrigger)
+      if(priceProfit < TrailProfitTrigger)
    {
       if(positionType == POSITION_TYPE_BUY)
       {
@@ -922,11 +1004,11 @@ bool ManageScaleInPosition()
          {
             double candidateTP = NormalizeDouble(currentPrice + trailTP, _Digits);
             double minAllowedTP = NormalizeDouble(openPrice + 5.0, _Digits);
-            if(candidateTP < g_scale_virtual_tp_price)
+            if(candidateTP < g_scale_virtual_tp_prices[stateIndex])
             {
                double limitedTP = MathMax(candidateTP, minAllowedTP);
-               if(limitedTP < g_scale_virtual_tp_price)
-                  g_scale_virtual_tp_price = limitedTP;
+               if(limitedTP < g_scale_virtual_tp_prices[stateIndex])
+                  g_scale_virtual_tp_prices[stateIndex] = limitedTP;
             }
          }
       }
@@ -934,73 +1016,74 @@ bool ManageScaleInPosition()
       {
          double candidateTP = NormalizeDouble(currentPrice - trailTP, _Digits);
          double maxAllowedTP = NormalizeDouble(openPrice - 5.0, _Digits);
-         if(candidateTP > g_scale_virtual_tp_price)
+         if(candidateTP > g_scale_virtual_tp_prices[stateIndex])
          {
             double limitedTP = MathMin(candidateTP, maxAllowedTP);
-            if(limitedTP > g_scale_virtual_tp_price)
-               g_scale_virtual_tp_price = limitedTP;
+            if(limitedTP > g_scale_virtual_tp_prices[stateIndex])
+               g_scale_virtual_tp_prices[stateIndex] = limitedTP;
          }
       }
    }
-   else
+      else
    {
       if(positionType == POSITION_TYPE_BUY)
       {
          double newTrailTP = NormalizeDouble(currentPrice - TrailProfitOffset, _Digits);
-         if(!g_scale_trail_tp_triggered || newTrailTP > g_scale_virtual_tp_price)
-            g_scale_virtual_tp_price = newTrailTP;
+         if(!g_scale_trail_tp_triggered_flags[stateIndex] || newTrailTP > g_scale_virtual_tp_prices[stateIndex])
+            g_scale_virtual_tp_prices[stateIndex] = newTrailTP;
       }
       else
       {
          double newTrailTP = NormalizeDouble(currentPrice + TrailProfitOffset, _Digits);
-         if(!g_scale_trail_tp_triggered || newTrailTP < g_scale_virtual_tp_price ||
-            g_scale_virtual_tp_price <= 0.0)
-            g_scale_virtual_tp_price = newTrailTP;
+         if(!g_scale_trail_tp_triggered_flags[stateIndex] || newTrailTP < g_scale_virtual_tp_prices[stateIndex] ||
+            g_scale_virtual_tp_prices[stateIndex] <= 0.0)
+            g_scale_virtual_tp_prices[stateIndex] = newTrailTP;
       }
-      g_scale_trail_tp_triggered = true;
+      g_scale_trail_tp_triggered_flags[stateIndex] = true;
    }
 
    if(positionType == POSITION_TYPE_BUY)
    {
       double newSL = NormalizeDouble(currentPrice - trailSL, _Digits);
-      if(newSL > g_scale_virtual_sl_price)
-         g_scale_virtual_sl_price = newSL;
+      if(newSL > g_scale_virtual_sl_prices[stateIndex])
+         g_scale_virtual_sl_prices[stateIndex] = newSL;
    }
    else
    {
       double newSL = NormalizeDouble(currentPrice + trailSL, _Digits);
-      if(newSL < g_scale_virtual_sl_price || g_scale_virtual_sl_price <= 0.0)
-         g_scale_virtual_sl_price = newSL;
+      if(newSL < g_scale_virtual_sl_prices[stateIndex] || g_scale_virtual_sl_prices[stateIndex] <= 0.0)
+         g_scale_virtual_sl_prices[stateIndex] = newSL;
    }
 
    bool hitTP = false;
    bool hitSL = false;
    if(positionType == POSITION_TYPE_BUY)
    {
-      hitTP = g_scale_virtual_tp_price > 0.0 && currentPrice >= g_scale_virtual_tp_price;
-      hitSL = g_scale_virtual_sl_price > 0.0 && currentPrice <= g_scale_virtual_sl_price;
+      hitTP = g_scale_virtual_tp_prices[stateIndex] > 0.0 && currentPrice >= g_scale_virtual_tp_prices[stateIndex];
+      hitSL = g_scale_virtual_sl_prices[stateIndex] > 0.0 && currentPrice <= g_scale_virtual_sl_prices[stateIndex];
    }
    else
    {
-      hitTP = g_scale_virtual_tp_price > 0.0 && currentPrice <= g_scale_virtual_tp_price;
-      hitSL = g_scale_virtual_sl_price > 0.0 && currentPrice >= g_scale_virtual_sl_price;
+      hitTP = g_scale_virtual_tp_prices[stateIndex] > 0.0 && currentPrice <= g_scale_virtual_tp_prices[stateIndex];
+      hitSL = g_scale_virtual_sl_prices[stateIndex] > 0.0 && currentPrice >= g_scale_virtual_sl_prices[stateIndex];
    }
 
    if(hitTP || hitSL)
    {
       PrintFormat("【加仓虚拟平仓】触发%s | 持仓ID:%I64u | 当前价:%.5f | 虚拟TP:%.5f | 虚拟SL:%.5f",
-                  hitTP ? "止盈" : "止损", g_scale_in_position_id, currentPrice,
-                  g_scale_virtual_tp_price, g_scale_virtual_sl_price);
+                  hitTP ? "止盈" : "止损", positionId, currentPrice,
+                  g_scale_virtual_tp_prices[stateIndex], g_scale_virtual_sl_prices[stateIndex]);
       if(trade.PositionClose(positionTicket))
       {
          PrintFormat("【加仓虚拟平仓成功】%s，生命周期结束，不执行反向翻仓",
                      hitTP ? "止盈" : "止损");
-         ResetScaleInState();
+         UntrackScaleInPositionAt(stateIndex);
       }
       else
          PrintFormat("【加仓虚拟平仓失败】错误码: %d", trade.ResultRetcode());
    }
-   return true;
+   }
+   return ArraySize(g_scale_in_position_ids) > 0;
 }
 //+------------------------------------------------------------------+
 //| 【核心】虚拟移动止损 + 双模式止盈：前期逆势收紧，达标后切换顺势放大移动止盈   |
@@ -1288,15 +1371,19 @@ void CheckVirtualStopsAndClose()
          }
       }
    }
-   // ===== 2. 兜底全扫描（兼容加仓单） =====
+   // ===== 2. 主仓兜底检查：只处理当前明确登记的主仓 =====
+   if(g_monitor_position_id == INVALID_POSITION_ID)
+      return;
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong pt = PositionGetTicket(i);
       if(pt == 0 || !PositionSelectByTicket(pt)) continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
-      if(g_scale_in_position_id != INVALID_POSITION_ID &&
-         PositionGetInteger(POSITION_IDENTIFIER) == (long)g_scale_in_position_id)
+      if(PositionGetInteger(POSITION_IDENTIFIER) != (long)g_monitor_position_id)
+         continue;
+      if(IsTrackedScaleInPosition((ulong)PositionGetInteger(POSITION_IDENTIFIER)))
          continue;
       long   posType   = PositionGetInteger(POSITION_TYPE);
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
@@ -1306,12 +1393,6 @@ void CheckVirtualStopsAndClose()
       double priceMove = (posType == POSITION_TYPE_BUY) ? (curPrice - openPrice) : (openPrice - curPrice);
       double tpThreshold = g_monitoring_reverse_position ? REV_TP_USD : TP_USD;
       double slThreshold = g_monitoring_reverse_position ? REV_SL_USD : SL_USD;
-      if(g_monitor_position_id == INVALID_POSITION_ID ||
-         PositionGetInteger(POSITION_IDENTIFIER) != (long)g_monitor_position_id)
-      {
-         tpThreshold = REV_TP_USD;
-         slThreshold = REV_SL_USD;
-      }
       if(priceMove >= tpThreshold)
       {
          PrintFormat("【兜底虚拟止盈】强制平仓！Ticket:%I64u 移动:%.2f >= %.2f", pt, priceMove, tpThreshold);
