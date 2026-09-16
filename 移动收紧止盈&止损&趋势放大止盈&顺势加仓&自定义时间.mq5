@@ -5,11 +5,12 @@
 //     3.3.5逆势收紧移动止盈开关
 //     3.3.6只要浮盈大于等于4尽早锁定利润
 //     3.3.7顺势放大止盈调整移动锁利模式&初始下单方向优先面板选择的下单，其次高周期趋势决定方向
+//。   3.3.8修复高周期趋势决定开仓方向不准确问题
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "3.3.7"
+#property version   "3.3.8"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -120,47 +121,50 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
       return DIR_SHORT;
    }
    
-   // 当前高周期收盘价（已收盘的最近一根）
+   // 只使用已收盘的高周期K线，避免当前形成中的K线造成方向抖动
    double close1 = iClose(_Symbol, HigherTF, 1);
-   double close2 = iClose(_Symbol, HigherTF, 2);
-   if(close1 <= 0.0 || close2 <= 0.0)
+   if(close1 <= 0.0)
    {
       Print("【趋势判断】获取高周期收盘价失败，趋势计算失败，默认首次做空");
       return DIR_SHORT;
    }
+
+   int confirmBars = MathMax(1, TrendConfirmBars);
+   for(int shift = 1; shift <= confirmBars; shift++)
+   {
+      double confirmedClose = iClose(_Symbol, HigherTF, shift);
+      if(confirmedClose <= 0.0)
+      {
+         PrintFormat("【趋势判断】无法获取第%d根已收盘K线，趋势计算失败，默认首次做空", shift);
+         return DIR_SHORT;
+      }
+   }
    
    // ===== 1. 斜率（更短窗口，更灵敏）=====
    // 用最近 3~4 根MA变化，比原来短很多
-   int slopeBars = MathMax(3, TrendConfirmBars);
+   int slopeBars = MathMax(3, confirmBars);
    double maSlope = ma[1] - ma[1 + slopeBars];
    double minSlope = TrendMinSlopePts * _Point;
    
-   // ===== 2. 近期确认（只要求最近1~2根，不再强制全部连续）=====
-   bool recentBullish = (close1 > ma[1]) && (close2 > ma[2] || close1 > ma[1] * 1.0001); // 最近一根强确认，前一根可宽松
-   bool recentBearish = (close1 < ma[1]) && (close2 < ma[2] || close1 < ma[1] * 0.9999);
-   
-   // 如果用户把 TrendConfirmBars 设为1，就只看最近一根
-   if(TrendConfirmBars <= 1)
+   // ===== 2. 连续确认：所有已收盘确认K线必须位于MA同一侧 =====
+   bool recentBullish = true;
+   bool recentBearish = true;
+   for(int shift = 1; shift <= confirmBars; shift++)
    {
-      recentBullish = (close1 > ma[1]);
-      recentBearish = (close1 < ma[1]);
+      double confirmedClose = iClose(_Symbol, HigherTF, shift);
+      recentBullish = recentBullish && (confirmedClose > ma[shift]);
+      recentBearish = recentBearish && (confirmedClose < ma[shift]);
    }
-   
-   // ===== 3. 当前价位置过滤（再加一层保险）=====
-   // 用当前形成中的高周期K线收盘价（实时性最好）
-   double close0 = iClose(_Symbol, HigherTF, 0);
-   bool currentAbove = (close0 > ma[0]);
-   bool currentBelow = (close0 < ma[0]);
    
    ENUM_INIT_DIRECTION dir;
    
-   // 做多条件：近期偏多 + 斜率向上超过阈值 + 当前价仍在MA上方
-   if(recentBullish && maSlope > minSlope && currentAbove)
+   // 做多条件：连续已收盘K线在MA上方 + 斜率向上超过阈值
+   if(recentBullish && maSlope > minSlope)
    {
       dir = DIR_LONG;
    }
-   // 做空条件：近期偏空 + 斜率向下超过阈值 + 当前价仍在MA下方
-   else if(recentBearish && maSlope < -minSlope && currentBelow)
+   // 做空条件：连续已收盘K线在MA下方 + 斜率向下超过阈值
+   else if(recentBearish && maSlope < -minSlope)
    {
       dir = DIR_SHORT;
    }
@@ -173,7 +177,7 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
    
    PrintFormat("【高周期趋势-灵敏版】TF:%s  MA[1]:%.5f  收盘[1]:%.5f  斜率:%.1f点  确认根数:%d → 方向:%s",
                EnumToString(HigherTF), ma[1], close1,
-               maSlope / _Point, TrendConfirmBars,
+               maSlope / _Point, confirmBars,
                (dir == DIR_LONG ? "做多" : "做空"));
                
    return dir;
