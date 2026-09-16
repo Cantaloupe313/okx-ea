@@ -4,7 +4,7 @@
 //     3.3.4自定义交易时间
 //     3.3.5逆势收紧移动止盈开关
 //     3.3.6只要浮盈大于等于4尽早锁定利润
-//     3.3.7顺势放大止盈调整移动锁利模式
+//     3.3.7顺势放大止盈调整移动锁利模式&初始下单方向优先面板选择的下单，其次高周期趋势决定方向
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
@@ -20,11 +20,12 @@ CTrade trade;
 enum ENUM_INIT_DIRECTION
 {
    DIR_SHORT = 0,  // 初始做空
-   DIR_LONG  = 1   // 初始做多
+   DIR_LONG  = 1,  // 初始做多
+   DIR_AUTO  = 2   // 未指定方向，按高周期趋势决定
 };
 //===== 外部参数 =====
 input ulong   InpMagicNumber     = 888151;  // EA魔术码(用于区分订单)
-input ENUM_INIT_DIRECTION InitialDirection = DIR_SHORT; // 备用初始方向（仅当高周期趋势计算失败时使用）
+input ENUM_INIT_DIRECTION InitialDirection = DIR_AUTO; // 首次开仓方向：明确选择多/空时优先，否则按高周期趋势
 
 // ★★★ 自定义交易时间段（高流动性时段）★★★
 input bool   EnableCustomTradingHours = false;   // 是否启用自定义交易时间段
@@ -105,8 +106,8 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
 {
    if(g_trend_ma_handle == INVALID_HANDLE)
    {
-      Print("【趋势判断】MA句柄无效，使用备用方向");
-      return InitialDirection;
+      Print("【趋势判断】MA句柄无效，趋势计算失败，默认首次做空");
+      return DIR_SHORT;
    }
    
    // 多取几根保证数据充足
@@ -115,8 +116,8 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
    ArraySetAsSeries(ma, true);
    if(CopyBuffer(g_trend_ma_handle, 0, 0, needBars, ma) < needBars)
    {
-      Print("【趋势判断】复制MA缓冲失败，使用备用方向");
-      return InitialDirection;
+      Print("【趋势判断】复制MA缓冲失败，趋势计算失败，默认首次做空");
+      return DIR_SHORT;
    }
    
    // 当前高周期收盘价（已收盘的最近一根）
@@ -124,8 +125,8 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
    double close2 = iClose(_Symbol, HigherTF, 2);
    if(close1 <= 0.0 || close2 <= 0.0)
    {
-      Print("【趋势判断】获取高周期收盘价失败，使用备用方向");
-      return InitialDirection;
+      Print("【趋势判断】获取高周期收盘价失败，趋势计算失败，默认首次做空");
+      return DIR_SHORT;
    }
    
    // ===== 1. 斜率（更短窗口，更灵敏）=====
@@ -165,10 +166,9 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
    }
    else
    {
-      // 震荡或不明确 → 使用备用方向
-      PrintFormat("【趋势判断】高周期震荡或不明确（确认不足或斜率不足），使用备用方向:%s",
-                  (InitialDirection == DIR_LONG ? "做多" : "做空"));
-      return InitialDirection;
+      // 震荡或不明确 → 按要求默认首次做空
+      Print("【趋势判断】高周期震荡或不明确（确认不足或斜率不足），默认首次做空");
+      return DIR_SHORT;
    }
    
    PrintFormat("【高周期趋势-灵敏版】TF:%s  MA[1]:%.5f  收盘[1]:%.5f  斜率:%.1f点  确认根数:%d → 方向:%s",
@@ -225,8 +225,19 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
    g_nextTriggerTime = CalculateNextTriggerTime(TimeTradeServer());
-   // ★★★ 第一次下单方向由高周期趋势决定 ★★★
-   g_currentDirection = GetHigherTFTrendDirection();
+   // ★★★ 第一次下单：面板明确方向优先，否则按高周期趋势决定 ★★★
+   if(InitialDirection == DIR_SHORT || InitialDirection == DIR_LONG)
+   {
+      g_currentDirection = InitialDirection;
+      PrintFormat("【首次开仓方向】使用面板配置方向：%s",
+                  (g_currentDirection == DIR_LONG ? "做多" : "做空"));
+   }
+   else
+   {
+      g_currentDirection = GetHigherTFTrendDirection();
+      PrintFormat("【首次开仓方向】面板未指定方向，使用高周期趋势：%s",
+                  (g_currentDirection == DIR_LONG ? "做多" : "做空"));
+   }
    if(g_currentDirection == DIR_SHORT)
       PrintFormat("EA启动 v3.3.7【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
