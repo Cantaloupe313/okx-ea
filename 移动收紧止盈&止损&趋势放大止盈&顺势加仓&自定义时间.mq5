@@ -6,11 +6,12 @@
 //     3.3.6只要浮盈大于等于4尽早锁定利润
 //     3.3.7顺势放大止盈调整移动锁利模式&初始下单方向优先面板选择的下单，其次高周期趋势决定方向
 //。   3.3.8修复高周期趋势决定开仓方向不准确问题
+//。   3.3.9加仓单独立管理，包含逆势收紧止盈，移动止损，早期锁利，保本损，顺势放大移动止盈
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "3.3.8"
+#property version   "3.3.9"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -48,7 +49,7 @@ input double LotShort           = 0.01;     // 初始做空手数
 input double LotLong            = 0.01;     // 初始做多手数
 input double LotLongReverse     = 0.01;     // 做空止损反向多单手数
 input double LotShortReverse    = 0.01;     // 做多止损反向空手数
-input double LotScaleIn         = 0.01;     // ★新增：锁定利润时加仓手数
+input double LotScaleIn         = 0.01;     // ★新增：锁定利润时加仓手数，0跳过加仓
 input bool   EnableScaleIn      = true;     // ★新增：是否启用锁定利润时加仓
 input double MinBalanceForScaleIn = 200;    // ★新增：账户余额达到此值才允许顺势加仓（0=不限制）
 input bool   EnableTPTighten     = true;     // ★新增：是否启用移动止盈收紧（逆势收紧）
@@ -98,6 +99,11 @@ bool                 g_need_reopen_after_swap = false;
 ENUM_INIT_DIRECTION  g_reopen_direction       = DIR_SHORT;
 bool   g_scaled_in = false;                  // ★新增：是否已在本轮锁定时加仓
 bool   g_trail_tp_triggered = false;         // 是否已首次达到放大止盈触发值
+ulong  g_scale_in_position_id = INVALID_POSITION_ID;
+bool   g_scale_in_is_reverse_position = false;
+double g_scale_virtual_sl_price = 0.0;
+double g_scale_virtual_tp_price = 0.0;
+bool   g_scale_trail_tp_triggered = false;
 // ★★★ 高周期趋势指标句柄 ★★★
 int g_trend_ma_handle = INVALID_HANDLE;
 //+------------------------------------------------------------------+
@@ -692,7 +698,7 @@ void ExecuteScaleInOrder(long posType)
    }
    
    bool success = false;
-   double openPrice = 0.0;
+   ulong positionId = INVALID_POSITION_ID;
    
    if(posType == POSITION_TYPE_BUY)
    {
@@ -701,7 +707,6 @@ void ExecuteScaleInOrder(long posType)
       if(trade.Buy(LotScaleIn, _Symbol, ask, 0, 0, ""))
       {
          success = true;
-         openPrice = ask;
          PrintFormat("【锁定加仓-多】成功加仓 %.2f 手，开仓价:%.5f", LotScaleIn, ask);
       }
       else
@@ -714,7 +719,6 @@ void ExecuteScaleInOrder(long posType)
       if(trade.Sell(LotScaleIn, _Symbol, bid, 0, 0, ""))
       {
          success = true;
-         openPrice = bid;
          PrintFormat("【锁定加仓-空】成功加仓 %.2f 手，开仓价:%.5f", LotScaleIn, bid);
       }
       else
@@ -724,9 +728,39 @@ void ExecuteScaleInOrder(long posType)
    if(success)
    {
       g_scaled_in = true;
-      // 加仓单立即继承当前虚拟止盈/止损距离（与初始单规则一致）
-      // 注意：监控仍以原主仓为主，加仓单通过兜底扫描 + 虚拟逻辑统一管理
-      PrintFormat("【锁定加仓完成】已标记 g_scaled_in=true，加仓单将跟随初始单虚拟移动止盈止损逻辑");
+      ulong dealTicket = trade.ResultDeal();
+      positionId = (dealTicket > 0 && HistoryDealSelect(dealTicket)) ?
+                   HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID) : INVALID_POSITION_ID;
+      if(positionId == INVALID_POSITION_ID)
+         positionId = GetLatestPositionID();
+
+      double openPrice = 0.0;
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong positionTicket = PositionGetTicket(i);
+         if(positionTicket > 0 && PositionSelectByTicket(positionTicket) &&
+            PositionGetInteger(POSITION_IDENTIFIER) == (long)positionId)
+         {
+            openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            break;
+         }
+      }
+      if(openPrice <= 0.0)
+      {
+         Print("【加仓错误】无法获取加仓持仓价格，放弃独立加仓监控");
+         g_scaled_in = false;
+         return;
+      }
+
+      g_scale_in_position_id = positionId;
+      g_scale_in_is_reverse_position = g_monitoring_reverse_position;
+      g_scale_virtual_sl_price = NormalizeDouble(
+         openPrice + (posType == POSITION_TYPE_BUY ? -SL_USD : SL_USD), _Digits);
+      g_scale_virtual_tp_price = NormalizeDouble(
+         openPrice + (posType == POSITION_TYPE_BUY ? TP_USD : -TP_USD), _Digits);
+      g_scale_trail_tp_triggered = false;
+      PrintFormat("【锁定加仓完成】持仓ID:%I64u，已启用独立移动止损、逆势收紧止盈、保本损和顺势移动止盈",
+                  g_scale_in_position_id);
    }
 }
 //+------------------------------------------------------------------+
@@ -796,11 +830,184 @@ void ExecuteLongOrder()
                   ask, trade.ResultRetcode(), trade.ResultRetcodeDescription());
    }
 }
+void ResetScaleInState()
+{
+   g_scale_in_position_id = INVALID_POSITION_ID;
+   g_scale_in_is_reverse_position = false;
+   g_scale_virtual_sl_price = 0.0;
+   g_scale_virtual_tp_price = 0.0;
+   g_scale_trail_tp_triggered = false;
+}
+
+bool ManageScaleInPosition()
+{
+   if(g_scale_in_position_id == INVALID_POSITION_ID)
+      return false;
+
+   ulong positionTicket = 0;
+   long positionType = -1;
+   double openPrice = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket) &&
+         PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
+         PositionGetInteger(POSITION_IDENTIFIER) == (long)g_scale_in_position_id)
+      {
+         positionTicket = ticket;
+         positionType = PositionGetInteger(POSITION_TYPE);
+         openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         break;
+      }
+   }
+
+   if(positionTicket == 0)
+   {
+      ResetScaleInState();
+      return false;
+   }
+
+   double currentPrice = (positionType == POSITION_TYPE_BUY) ?
+                         SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+                         SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double priceProfit = (positionType == POSITION_TYPE_BUY) ?
+                        currentPrice - openPrice : openPrice - currentPrice;
+   double trailSL = g_scale_in_is_reverse_position ? REV_SL_USD : SL_USD;
+   double trailTP = g_scale_in_is_reverse_position ? REV_TP_USD : TP_USD;
+
+   if(EarlyLockProfit > 0.0 && priceProfit >= EarlyLockProfit &&
+      priceProfit < TrailProfitTrigger)
+   {
+      if(positionType == POSITION_TYPE_BUY)
+      {
+         double earlySL = NormalizeDouble(currentPrice - EarlyLockOffset, _Digits);
+         double minEarlySL = NormalizeDouble(openPrice + 1.0, _Digits);
+         if(earlySL < minEarlySL) earlySL = minEarlySL;
+         if(earlySL > g_scale_virtual_sl_price)
+            g_scale_virtual_sl_price = earlySL;
+      }
+      else
+      {
+         double earlySL = NormalizeDouble(currentPrice + EarlyLockOffset, _Digits);
+         double maxEarlySL = NormalizeDouble(openPrice - 1.0, _Digits);
+         if(earlySL > maxEarlySL) earlySL = maxEarlySL;
+         if(earlySL < g_scale_virtual_sl_price || g_scale_virtual_sl_price <= 0.0)
+            g_scale_virtual_sl_price = earlySL;
+      }
+   }
+
+   if(BreakEvenProfit > 0.0)
+   {
+      if(positionType == POSITION_TYPE_BUY)
+      {
+         double bePrice = NormalizeDouble(openPrice + BreakEvenOffset, _Digits);
+         if(priceProfit >= BreakEvenProfit && g_scale_virtual_sl_price < bePrice)
+            g_scale_virtual_sl_price = bePrice;
+      }
+      else
+      {
+         double bePrice = NormalizeDouble(openPrice - BreakEvenOffset, _Digits);
+         if(priceProfit >= BreakEvenProfit &&
+            (g_scale_virtual_sl_price > bePrice || g_scale_virtual_sl_price <= 0.0))
+            g_scale_virtual_sl_price = bePrice;
+      }
+   }
+
+   if(priceProfit < TrailProfitTrigger)
+   {
+      if(positionType == POSITION_TYPE_BUY)
+      {
+         if(EnableTPTighten)
+         {
+            double candidateTP = NormalizeDouble(currentPrice + trailTP, _Digits);
+            double minAllowedTP = NormalizeDouble(openPrice + 5.0, _Digits);
+            if(candidateTP < g_scale_virtual_tp_price)
+            {
+               double limitedTP = MathMax(candidateTP, minAllowedTP);
+               if(limitedTP < g_scale_virtual_tp_price)
+                  g_scale_virtual_tp_price = limitedTP;
+            }
+         }
+      }
+      else if(EnableTPTighten)
+      {
+         double candidateTP = NormalizeDouble(currentPrice - trailTP, _Digits);
+         double maxAllowedTP = NormalizeDouble(openPrice - 5.0, _Digits);
+         if(candidateTP > g_scale_virtual_tp_price)
+         {
+            double limitedTP = MathMin(candidateTP, maxAllowedTP);
+            if(limitedTP > g_scale_virtual_tp_price)
+               g_scale_virtual_tp_price = limitedTP;
+         }
+      }
+   }
+   else
+   {
+      if(positionType == POSITION_TYPE_BUY)
+      {
+         double newTrailTP = NormalizeDouble(currentPrice - TrailProfitOffset, _Digits);
+         if(!g_scale_trail_tp_triggered || newTrailTP > g_scale_virtual_tp_price)
+            g_scale_virtual_tp_price = newTrailTP;
+      }
+      else
+      {
+         double newTrailTP = NormalizeDouble(currentPrice + TrailProfitOffset, _Digits);
+         if(!g_scale_trail_tp_triggered || newTrailTP < g_scale_virtual_tp_price ||
+            g_scale_virtual_tp_price <= 0.0)
+            g_scale_virtual_tp_price = newTrailTP;
+      }
+      g_scale_trail_tp_triggered = true;
+   }
+
+   if(positionType == POSITION_TYPE_BUY)
+   {
+      double newSL = NormalizeDouble(currentPrice - trailSL, _Digits);
+      if(newSL > g_scale_virtual_sl_price)
+         g_scale_virtual_sl_price = newSL;
+   }
+   else
+   {
+      double newSL = NormalizeDouble(currentPrice + trailSL, _Digits);
+      if(newSL < g_scale_virtual_sl_price || g_scale_virtual_sl_price <= 0.0)
+         g_scale_virtual_sl_price = newSL;
+   }
+
+   bool hitTP = false;
+   bool hitSL = false;
+   if(positionType == POSITION_TYPE_BUY)
+   {
+      hitTP = g_scale_virtual_tp_price > 0.0 && currentPrice >= g_scale_virtual_tp_price;
+      hitSL = g_scale_virtual_sl_price > 0.0 && currentPrice <= g_scale_virtual_sl_price;
+   }
+   else
+   {
+      hitTP = g_scale_virtual_tp_price > 0.0 && currentPrice <= g_scale_virtual_tp_price;
+      hitSL = g_scale_virtual_sl_price > 0.0 && currentPrice >= g_scale_virtual_sl_price;
+   }
+
+   if(hitTP || hitSL)
+   {
+      PrintFormat("【加仓虚拟平仓】触发%s | 持仓ID:%I64u | 当前价:%.5f | 虚拟TP:%.5f | 虚拟SL:%.5f",
+                  hitTP ? "止盈" : "止损", g_scale_in_position_id, currentPrice,
+                  g_scale_virtual_tp_price, g_scale_virtual_sl_price);
+      if(trade.PositionClose(positionTicket))
+      {
+         PrintFormat("【加仓虚拟平仓成功】%s，生命周期结束，不执行反向翻仓",
+                     hitTP ? "止盈" : "止损");
+         ResetScaleInState();
+      }
+      else
+         PrintFormat("【加仓虚拟平仓失败】错误码: %d", trade.ResultRetcode());
+   }
+   return true;
+}
 //+------------------------------------------------------------------+
 //| 【核心】虚拟移动止损 + 双模式止盈：前期逆势收紧，达标后切换顺势放大移动止盈   |
 //+------------------------------------------------------------------+
 void CheckVirtualStopsAndClose()
 {
+   ManageScaleInPosition();
    // ===== 1. 优先检查当前监控持仓 =====
    if(g_monitor_position_id != INVALID_POSITION_ID &&
       (g_virtual_sl_price > 0.0 || g_virtual_tp_price > 0.0))
@@ -1088,6 +1295,9 @@ void CheckVirtualStopsAndClose()
       if(pt == 0 || !PositionSelectByTicket(pt)) continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      if(g_scale_in_position_id != INVALID_POSITION_ID &&
+         PositionGetInteger(POSITION_IDENTIFIER) == (long)g_scale_in_position_id)
+         continue;
       long   posType   = PositionGetInteger(POSITION_TYPE);
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double curPrice  = (posType == POSITION_TYPE_BUY) ?
