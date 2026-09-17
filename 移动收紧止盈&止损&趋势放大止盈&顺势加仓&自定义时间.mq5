@@ -8,11 +8,12 @@
 //。   3.3.8修复高周期趋势决定开仓方向不准确问题
 //。   3.3.9加仓单独立管理，包含逆势收紧止盈，移动止损，早期锁利，保本损，顺势放大移动止盈&修复若干问题
 //。   3.3.10修复顺势放大止盈会立即平仓
+//。   3.3.11第一次开仓方向取反向调试看效果
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "3.3.10"
+#property version   "3.3.11"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -169,12 +170,12 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
    // 做多条件：连续已收盘K线在MA上方 + 斜率向上超过阈值
    if(recentBullish && maSlope > minSlope)
    {
-      dir = DIR_LONG;
+      dir = DIR_SHORT; // 取反向调试
    }
    // 做空条件：连续已收盘K线在MA下方 + 斜率向下超过阈值
    else if(recentBearish && maSlope < -minSlope)
    {
-      dir = DIR_SHORT;
+      dir = DIR_LONG; //取反调试
    }
    else
    {
@@ -251,10 +252,10 @@ int OnInit()
                   (g_currentDirection == DIR_LONG ? "做多" : "做空"));
    }
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v3.3.10【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.11【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    else
-      PrintFormat("EA启动 v3.3.10【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.11【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    return INIT_SUCCEEDED;
 }
