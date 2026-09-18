@@ -9,11 +9,12 @@
 //。   3.3.9加仓单独立管理，包含逆势收紧止盈，移动止损，早期锁利，保本损，顺势放大移动止盈&修复若干问题
 //。   3.3.10修复顺势放大止盈会立即平仓
 //。   3.3.11第一次开仓方向取反向调试看效果
+//。   3.3.12修复早期锁利/顺势止盈/加仓跳过日志过于频繁：改为最多每1分钟打印一次
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "3.3.11"
+#property version   "3.3.12"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -252,10 +253,10 @@ int OnInit()
                   (g_currentDirection == DIR_LONG ? "做多" : "做空"));
    }
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v3.3.11【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.12【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    else
-      PrintFormat("EA启动 v3.3.11【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.12【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    return INIT_SUCCEEDED;
 }
@@ -705,7 +706,14 @@ void ExecuteScaleInOrder(long posType)
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(MinBalanceForScaleIn > 0.0 && currentBalance < MinBalanceForScaleIn)
    {
-      PrintFormat("【加仓跳过】账户余额 %.2f < 配置阈值 %.2f，本次不加仓", currentBalance, MinBalanceForScaleIn);
+      // 最多每 1 分钟打印一次，避免刷屏
+      static datetime s_lastScaleSkipLogTime = 0;
+      datetime nowServer = TimeTradeServer();
+      if(nowServer - s_lastScaleSkipLogTime >= 60)
+      {
+         PrintFormat("【加仓跳过】账户余额 %.2f < 配置阈值 %.2f，本次不加仓", currentBalance, MinBalanceForScaleIn);
+         s_lastScaleSkipLogTime = nowServer;
+      }
       return;
    }
    
@@ -1103,6 +1111,12 @@ bool ManageScaleInPosition()
 void CheckVirtualStopsAndClose()
 {
    ManageScaleInPosition();
+   // 日志节流：早期锁利 / 顺势移动止盈 最多每 60 秒打印一次
+   static datetime s_lastEarlyLockLogTime = 0;
+   static datetime s_lastTrailTPLogTime   = 0;
+   const int LOG_INTERVAL_SEC = 60;
+   datetime nowServer = TimeTradeServer();
+
    // ===== 1. 优先检查当前监控持仓 =====
    if(g_monitor_position_id != INVALID_POSITION_ID &&
       (g_virtual_sl_price > 0.0 || g_virtual_tp_price > 0.0))
@@ -1159,8 +1173,13 @@ void CheckVirtualStopsAndClose()
                   g_virtual_sl_price = earlySL;
                   if(g_monitoring_reverse_position)
                      g_reverse_sl_price = earlySL;
-                  PrintFormat("【早期锁利-多】浮盈%.2f ≥%.1f 且未达%.1f，止损上移至 %.5f（锁约%.1f点）",
-                              priceProfit, EarlyLockProfit, TrailProfitTrigger, g_virtual_sl_price, priceProfit - EarlyLockOffset);
+                  // 最多每 1 分钟打印一次，避免刷屏
+                  if(nowServer - s_lastEarlyLockLogTime >= LOG_INTERVAL_SEC)
+                  {
+                     PrintFormat("【早期锁利-多】浮盈%.2f ≥%.1f 且未达%.1f，止损上移至 %.5f（锁约%.1f点）",
+                                 priceProfit, EarlyLockProfit, TrailProfitTrigger, g_virtual_sl_price, priceProfit - EarlyLockOffset);
+                     s_lastEarlyLockLogTime = nowServer;
+                  }
                }
             }
             else // SELL
@@ -1176,8 +1195,13 @@ void CheckVirtualStopsAndClose()
                   g_virtual_sl_price = earlySL;
                   if(g_monitoring_reverse_position)
                      g_reverse_sl_price = earlySL;
-                  PrintFormat("【早期锁利-空】浮盈%.2f ≥%.1f 且未达%.1f，止损下移至 %.5f（锁约%.1f点）",
-                              priceProfit, EarlyLockProfit, TrailProfitTrigger, g_virtual_sl_price, priceProfit - EarlyLockOffset);
+                  // 最多每 1 分钟打印一次，避免刷屏
+                  if(nowServer - s_lastEarlyLockLogTime >= LOG_INTERVAL_SEC)
+                  {
+                     PrintFormat("【早期锁利-空】浮盈%.2f ≥%.1f 且未达%.1f，止损下移至 %.5f（锁约%.1f点）",
+                                 priceProfit, EarlyLockProfit, TrailProfitTrigger, g_virtual_sl_price, priceProfit - EarlyLockOffset);
+                     s_lastEarlyLockLogTime = nowServer;
+                  }
                }
             }
          }
@@ -1301,7 +1325,12 @@ void CheckVirtualStopsAndClose()
                      g_virtual_tp_price = newTrailTP;
                      if(g_monitoring_reverse_position)
                         g_reverse_tp_price = g_virtual_tp_price;
-                     PrintFormat("【顺势移动止盈-多】当前价:%.5f，止盈更新至%.5f", currentPrice, g_virtual_tp_price);
+                     // 最多每 1 分钟打印一次，避免刷屏
+                     if(nowServer - s_lastTrailTPLogTime >= LOG_INTERVAL_SEC)
+                     {
+                        PrintFormat("【顺势移动止盈-多】当前价:%.5f，止盈更新至%.5f", currentPrice, g_virtual_tp_price);
+                        s_lastTrailTPLogTime = nowServer;
+                     }
                  }
              }
              else // SELL
@@ -1313,7 +1342,12 @@ void CheckVirtualStopsAndClose()
                      g_virtual_tp_price = newTrailTP;
                      if(g_monitoring_reverse_position)
                         g_reverse_tp_price = g_virtual_tp_price;
-                     PrintFormat("【顺势移动止盈-空】当前价:%.5f，止盈更新至%.5f", currentPrice, g_virtual_tp_price);
+                     // 最多每 1 分钟打印一次，避免刷屏
+                     if(nowServer - s_lastTrailTPLogTime >= LOG_INTERVAL_SEC)
+                     {
+                        PrintFormat("【顺势移动止盈-空】当前价:%.5f，止盈更新至%.5f", currentPrice, g_virtual_tp_price);
+                        s_lastTrailTPLogTime = nowServer;
+                     }
                  }
              }
 
