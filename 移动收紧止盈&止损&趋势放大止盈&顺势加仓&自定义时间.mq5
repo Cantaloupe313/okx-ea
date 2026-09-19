@@ -10,11 +10,12 @@
 //。   3.3.10修复顺势放大止盈会立即平仓
 //。   3.3.11第一次开仓方向取反向调试看效果
 //。   3.3.12修复早期锁利/顺势止盈/加仓跳过日志过于频繁：改为最多每1分钟打印一次
+//。   3.3.13锁利触发平仓若实际盈亏>7按盈利平仓处理：初始单不挂反向，反向单下次开仓反转方向
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "3.3.12"
+#property version   "3.3.13"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -253,10 +254,10 @@ int OnInit()
                   (g_currentDirection == DIR_LONG ? "做多" : "做空"));
    }
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v3.3.12【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.13【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    else
-      PrintFormat("EA启动 v3.3.12【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v3.3.13【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    return INIT_SUCCEEDED;
 }
@@ -527,6 +528,36 @@ void CancelAssociatedPendingOrder()
    }
    if(extraDeleted > 0)
       PrintFormat("【安全撤单】共额外清理 %d 个残留挂单", extraDeleted);
+}
+//+------------------------------------------------------------------+
+//| 获取指定持仓最近一次OUT成交的盈亏（含佣金/库存费后的净利）         |
+//+------------------------------------------------------------------+
+double GetClosedPositionProfit(ulong position_id)
+{
+   if(position_id == INVALID_POSITION_ID) return 0.0;
+   for(int retry = 0; retry < 6; retry++)
+   {
+      if(!HistorySelectByPosition(position_id))
+      {
+         if(retry < 5) Sleep(80 + retry * 40);
+         continue;
+      }
+      int total = HistoryDealsTotal();
+      for(int i = total - 1; i >= 0; i--)
+      {
+         ulong deal = HistoryDealGetTicket(i);
+         if(deal == 0) continue;
+         long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
+         if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY) continue;
+         // 返回净盈亏（利润 + 库存费 + 佣金）
+         double profit = HistoryDealGetDouble(deal, DEAL_PROFIT);
+         double swap   = HistoryDealGetDouble(deal, DEAL_SWAP);
+         double commission = HistoryDealGetDouble(deal, DEAL_COMMISSION);
+         return profit + swap + commission;
+      }
+      if(retry < 5) Sleep(80 + retry * 40);
+   }
+   return 0.0;
 }
 //+------------------------------------------------------------------+
 //| 判断指定持仓是否以止盈方式平仓                                     |
@@ -1397,29 +1428,57 @@ void CheckVirtualStopsAndClose()
             string reason = hitTP ? "虚拟移动止盈(逆势/顺势)" : "虚拟移动止损";
             PrintFormat("【虚拟平仓】触发%s | 持仓ID:%I64u | 当前价:%.5f | 虚拟TP:%.5f | 虚拟SL:%.5f",
                         reason, g_monitor_position_id, currentPrice, g_virtual_tp_price, g_virtual_sl_price);
+            // 先按原逻辑设置，后面若锁利且实际盈利>7再覆盖
             g_last_close_was_tp = hitTP;
             if(trade.PositionClose(posTicket))
             {
                PrintFormat("【虚拟平仓成功】%s 已执行", reason);
-               // 初始单止损后，立即开反向翻仓单
-               if(hitSL && !g_monitoring_reverse_position)
+
+               // ★ 3.3.13：锁利触发（hitSL）时检查实际盈亏，>7 按盈利平仓处理
+               bool treatAsProfitableClose = false;
+               if(hitSL)
                {
-                  Print("【初始单止损】立即执行反向翻仓...");
-                  ResetTrackTPState();
-                  g_monitor_position_id = INVALID_POSITION_ID;
-                  g_virtual_sl_price = 0.0;
-                  g_virtual_tp_price = 0.0;
-                  ExecuteReverseOrder();
+                  double closedProfit = GetClosedPositionProfit(g_monitor_position_id);
+                  if(closedProfit > 7.0)
+                  {
+                     treatAsProfitableClose = true;
+                     g_last_close_was_tp = true;   // 让反向单也能走“止盈反转方向”逻辑
+                     PrintFormat("【锁利盈利平仓】实际净盈亏 %.2f > 7，按盈利平仓处理（初始单不挂反向 / 反向单下次反转方向）",
+                                 closedProfit);
+                  }
+                  else
+                  {
+                     PrintFormat("【锁利/止损平仓】实际净盈亏 %.2f ≤ 7，按普通止损处理", closedProfit);
+                  }
                }
-               else if(hitTP && !g_monitoring_reverse_position)
+
+               // ===== 初始单处理 =====
+               if(!g_monitoring_reverse_position)
                {
-                  // 初始单止盈：仅清理
-                  ResetTrackTPState();
-                  g_monitor_position_id = INVALID_POSITION_ID;
-                  g_virtual_sl_price = 0.0;
-                  g_virtual_tp_price = 0.0;
-                  Print("【初始单移动止盈】已平仓，不进行翻仓");
+                  if(hitSL && !treatAsProfitableClose)
+                  {
+                     // 真正止损（含锁利但盈利≤7）→ 立即反向翻仓
+                     Print("【初始单止损】立即执行反向翻仓...");
+                     ResetTrackTPState();
+                     g_monitor_position_id = INVALID_POSITION_ID;
+                     g_virtual_sl_price = 0.0;
+                     g_virtual_tp_price = 0.0;
+                     ExecuteReverseOrder();
+                  }
+                  else
+                  {
+                     // 止盈 或 锁利且盈利>7 → 只清理，不挂反向
+                     ResetTrackTPState();
+                     g_monitor_position_id = INVALID_POSITION_ID;
+                     g_virtual_sl_price = 0.0;
+                     g_virtual_tp_price = 0.0;
+                     if(treatAsProfitableClose)
+                        Print("【初始单锁利盈利平仓】已平仓，不进行翻仓");
+                     else
+                        Print("【初始单移动止盈】已平仓，不进行翻仓");
+                  }
                }
+               // 反向单：只需设置好 g_last_close_was_tp，后续 MonitorPositionStatus 会根据它决定是否反转方向
             }
             else
                PrintFormat("【虚拟平仓失败】错误码: %d", trade.ResultRetcode());
