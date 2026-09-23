@@ -11,11 +11,12 @@
 //。   3.3.11第一次开仓方向取反向调试看效果
 //。   3.3.12修复早期锁利/顺势止盈/加仓跳过日志过于频繁：改为最多每1分钟打印一次
 //。   3.3.13锁利触发平仓若实际盈亏>7按盈利平仓处理：初始单不挂反向，反向单下次开仓反转方向
+//。   5.3.14初始单止损平仓净亏≤配置阈值(默认-18)时不再立即反向翻仓（仅初始单）
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "3.3.13"
+#property version   "5.3.14"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -61,9 +62,10 @@ input double TP_USD             = 22;       // 初始单移动止盈距离（逆
 input double SL_USD             = 22;       // 初始单移动止损距离
 input double REV_SL_USD         = 22;       // 反向单移动止损距离
 input double REV_TP_USD         = 22;       // 反向单移动止盈距离（逆势收紧）
+input double SkipReverseLossThreshold = 0; // 初始单止损平仓净亏≤此值时不再立即反向翻仓（仅初始单，0=关闭此过滤）
 input double BreakEvenProfit   =  0;    // 浮盈达到此值时设置保本损（价格单位，0=关闭）
 input double BreakEvenOffset   = 10;     // 保本损相对开仓价的偏移量（多单+，空单-）
-input double EarlyLockProfit   = 7;   // ★新增：早期锁利触发浮盈（价格单位，≥此值开始锁利,0=关闭）
+input double EarlyLockProfit   = 13;   // ★新增：早期锁利触发浮盈（价格单位，≥此值开始锁利,0=关闭）
 input double EarlyLockOffset   = 7;   // ★新增：早期锁利偏移量（止损 = 当前价 ± 此值）
 input int    IntervalMinutes    = 5;        // 开仓间隔(分钟)
 input int    RepeatGuardMin     = 2;        // 防重复间隔(分钟)
@@ -254,10 +256,10 @@ int OnInit()
                   (g_currentDirection == DIR_LONG ? "做多" : "做空"));
    }
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v3.3.13【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v5.3.14【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理 + 重亏≤阈值跳过翻仓】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    else
-      PrintFormat("EA启动 v3.3.13【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
+      PrintFormat("EA启动 v5.3.14【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后立即翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理 + 重亏≤阈值跳过翻仓】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
                   IntervalMinutes, TargetNetProfit);
    return INIT_SUCCEEDED;
 }
@@ -1435,10 +1437,13 @@ void CheckVirtualStopsAndClose()
                PrintFormat("【虚拟平仓成功】%s 已执行", reason);
 
                // ★ 3.3.13：锁利触发（hitSL）时检查实际盈亏，>7 按盈利平仓处理
+               // ★ 3.3.14：初始单止损净亏 ≤ SkipReverseLossThreshold 时不再反向翻仓
                bool treatAsProfitableClose = false;
+               bool skipReverseOnHeavyLoss = false;
+               double closedProfit = 0.0;
                if(hitSL)
                {
-                  double closedProfit = GetClosedPositionProfit(g_monitor_position_id);
+                  closedProfit = GetClosedPositionProfit(g_monitor_position_id);
                   if(closedProfit > 7.0)
                   {
                      treatAsProfitableClose = true;
@@ -1449,15 +1454,24 @@ void CheckVirtualStopsAndClose()
                   else
                   {
                      PrintFormat("【锁利/止损平仓】实际净盈亏 %.2f ≤ 7，按普通止损处理", closedProfit);
+                     // 仅初始单：净亏达到或超过阈值（如 ≤ -18）则跳过反向翻仓
+                     if(!g_monitoring_reverse_position &&
+                        SkipReverseLossThreshold < 0.0 &&
+                        closedProfit <= SkipReverseLossThreshold)
+                     {
+                        skipReverseOnHeavyLoss = true;
+                        PrintFormat("【初始单重亏跳过翻仓】实际净盈亏 %.2f ≤ 阈值 %.2f，不再立即反向翻仓",
+                                    closedProfit, SkipReverseLossThreshold);
+                     }
                   }
                }
 
                // ===== 初始单处理 =====
                if(!g_monitoring_reverse_position)
                {
-                  if(hitSL && !treatAsProfitableClose)
+                  if(hitSL && !treatAsProfitableClose && !skipReverseOnHeavyLoss)
                   {
-                     // 真正止损（含锁利但盈利≤7）→ 立即反向翻仓
+                     // 真正止损（含锁利但盈利≤7，且未触发重亏过滤）→ 立即反向翻仓
                      Print("【初始单止损】立即执行反向翻仓...");
                      ResetTrackTPState();
                      g_monitor_position_id = INVALID_POSITION_ID;
@@ -1467,13 +1481,15 @@ void CheckVirtualStopsAndClose()
                   }
                   else
                   {
-                     // 止盈 或 锁利且盈利>7 → 只清理，不挂反向
+                     // 止盈 / 锁利盈利>7 / 重亏跳过翻仓 → 只清理，不挂反向
                      ResetTrackTPState();
                      g_monitor_position_id = INVALID_POSITION_ID;
                      g_virtual_sl_price = 0.0;
                      g_virtual_tp_price = 0.0;
                      if(treatAsProfitableClose)
                         Print("【初始单锁利盈利平仓】已平仓，不进行翻仓");
+                     else if(skipReverseOnHeavyLoss)
+                        Print("【初始单重亏平仓】已平仓，跳过反向翻仓");
                      else
                         Print("【初始单移动止盈】已平仓，不进行翻仓");
                   }
@@ -1511,6 +1527,7 @@ void CheckVirtualStopsAndClose()
       {
          PrintFormat("【兜底虚拟止损】强制平仓！Ticket:%I64u 移动:%.2f <= -%.2f", pt, priceMove, slThreshold);
          g_last_close_was_tp = false;
+         ulong fallbackPosId = g_monitor_position_id;
          if(trade.PositionClose(pt))
          {
             if(!g_monitoring_reverse_position)
@@ -1519,8 +1536,18 @@ void CheckVirtualStopsAndClose()
                g_monitor_position_id = INVALID_POSITION_ID;
                g_virtual_sl_price = 0.0;
                g_virtual_tp_price = 0.0;
-               Print("【兜底初始单止损】尝试立即反向翻仓...");
-               ExecuteReverseOrder();
+               // ★ 3.3.14：兜底路径同样检查净亏阈值，重亏则不反向
+               double closedProfitFallback = GetClosedPositionProfit(fallbackPosId);
+               if(SkipReverseLossThreshold < 0.0 && closedProfitFallback <= SkipReverseLossThreshold)
+               {
+                  PrintFormat("【兜底初始单重亏跳过翻仓】实际净盈亏 %.2f ≤ 阈值 %.2f，不再反向翻仓",
+                              closedProfitFallback, SkipReverseLossThreshold);
+               }
+               else
+               {
+                  Print("【兜底初始单止损】尝试立即反向翻仓...");
+                  ExecuteReverseOrder();
+               }
             }
             else
             {
