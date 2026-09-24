@@ -13,11 +13,13 @@
 //。   3.3.13锁利触发平仓若实际盈亏>7按盈利平仓处理：初始单不挂反向，反向单下次开仓反转方向
 //。   5.3.14初始单止损平仓净亏≤配置阈值(默认-18)时不再立即反向翻仓（仅初始单）
 //。   5.3.15初始单止损后延迟1分钟再按价格条件决定是否反向翻仓：多单要求最新价<平仓价，空单要求最新价>平仓价
+//。   5.3.16新增启动立即下单开关：横盘时可勾选启动后立即开仓，之后由定时开仓接管
+//     5.3.17取消取反向调试
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "5.3.15"
+#property version   "5.3.17"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -34,6 +36,7 @@ enum ENUM_INIT_DIRECTION
 //===== 外部参数 =====
 input ulong   InpMagicNumber     = 888151;  // EA魔术码(用于区分订单)
 input ENUM_INIT_DIRECTION InitialDirection = DIR_AUTO; // 首次开仓方向：明确选择多/空时优先，否则按高周期趋势
+input bool   EnableImmediateOpenOnStart = false; // ★新增：启动时立即开仓（横盘判断时勾选，之后由定时开仓接管）
 
 // ★★★ 自定义交易时间段（高流动性时段）★★★
 input bool   EnableCustomTradingHours = false;   // 是否启用自定义交易时间段
@@ -97,6 +100,7 @@ bool     g_monitoring_reverse_position = false;
 datetime g_pending_reverse_check_time = 0;
 double   g_reverse_tp_price = 0.0;
 double   g_reverse_sl_price = 0.0;
+bool     g_pending_immediate_open = false; // ★5.3.16：启动立即开仓待执行标志
 // ★★★ 5.3.15：初始单止损后延迟1分钟按价格条件再决定是否反向翻仓 ★★★
 datetime g_pending_sl_reverse_time = 0;   // >0 表示等待中，到期后检查价格条件
 double   g_sl_close_price = 0.0;          // 初始单止损平仓价
@@ -179,12 +183,12 @@ ENUM_INIT_DIRECTION GetHigherTFTrendDirection()
    // 做多条件：连续已收盘K线在MA上方 + 斜率向上超过阈值
    if(recentBullish && maSlope > minSlope)
    {
-      dir = DIR_SHORT; // 取反向调试
+      dir = DIR_LONG; // 取反向调试
    }
    // 做空条件：连续已收盘K线在MA下方 + 斜率向下超过阈值
    else if(recentBearish && maSlope < -minSlope)
    {
-      dir = DIR_LONG; //取反调试
+      dir = DIR_SHORT; //取反调试
    }
    else
    {
@@ -260,12 +264,16 @@ int OnInit()
       PrintFormat("【首次开仓方向】面板未指定方向，使用高周期趋势：%s",
                   (g_currentDirection == DIR_LONG ? "做多" : "做空"));
    }
+   // ★★★ 5.3.16：启动立即开仓开关 ★★★
+   g_pending_immediate_open = EnableImmediateOpenOnStart;
+   if(g_pending_immediate_open)
+      Print("【启动立即开仓】已启用：首次定时器将尝试立即开仓，之后由定时间隔接管");
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v5.3.15【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后延迟1分钟按价格条件翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理 + 重亏≤阈值跳过翻仓】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f",
-                  IntervalMinutes, TargetNetProfit);
+      PrintFormat("EA启动 v5.3.17【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后延迟1分钟按价格条件翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理 + 重亏≤阈值跳过翻仓 + 启动立即开仓】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f | 启动立即开仓:%s",
+                  IntervalMinutes, TargetNetProfit, (EnableImmediateOpenOnStart ? "开" : "关"));
    else
-      PrintFormat("EA启动 v5.3.15【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后延迟1分钟按价格条件翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理 + 重亏≤阈值跳过翻仓】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f",
-                  IntervalMinutes, TargetNetProfit);
+      PrintFormat("EA启动 v5.3.17【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后延迟1分钟按价格条件翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理 + 重亏≤阈值跳过翻仓 + 启动立即开仓】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f | 启动立即开仓:%s",
+                  IntervalMinutes, TargetNetProfit, (EnableImmediateOpenOnStart ? "开" : "关"));
    return INIT_SUCCEEDED;
 }
 //+------------------------------------------------------------------+
@@ -1901,6 +1909,42 @@ void OnTimer()
       if(IsInPreSwapWindow(serverNow))
          ScanAndCloseProfitablePositions();
       g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
+      return;
+   }
+   // ★★★ 5.3.16：启动立即开仓（只执行一次，成功或条件不满足后清除标志，之后由定时开仓接管）★★★
+   if(g_pending_immediate_open)
+   {
+      g_pending_immediate_open = false; // 无论成败只尝试一次，避免反复抢定时逻辑
+      if(!IsInCustomTradingHours(serverNow))
+      {
+         PrintFormat("【启动立即开仓】当前时间 %s 不在允许交易窗口内，跳过立即开仓，交由后续定时接管",
+                     TimeToString(serverNow, TIME_DATE|TIME_MINUTES));
+      }
+      else if(CheckHasAnyPendingOrder() || CheckHasAnyPosition())
+      {
+         Print("【启动立即开仓】已存在持仓或挂单，跳过立即开仓，交由后续定时接管");
+      }
+      else if(HasSkipOpenSignal())
+      {
+         Print("【启动立即开仓】检测到跳过开仓信号，跳过立即开仓");
+      }
+      else if(g_pending_sl_reverse_time > 0)
+      {
+         Print("【启动立即开仓】正在等待止损延迟翻仓，跳过立即开仓");
+      }
+      else
+      {
+         PrintFormat("【启动立即开仓】执行立即开仓 → %s",
+                     (g_currentDirection == DIR_LONG ? "做多" : "做空"));
+         if(g_currentDirection == DIR_SHORT)
+            ExecuteShortOrder();
+         else
+            ExecuteLongOrder();
+         g_lastTradeTime = serverNow;
+         // 下次定时按正常间隔计算，避免与立即单冲突
+         g_nextTriggerTime = CalculateNextTriggerTime(serverNow);
+      }
+      // 立即开仓处理完毕后本 tick 不再走下方定时开仓逻辑
       return;
    }
    if(g_need_reopen_after_swap)
