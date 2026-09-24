@@ -12,14 +12,14 @@
 //。   3.3.12修复早期锁利/顺势止盈/加仓跳过日志过于频繁：改为最多每1分钟打印一次
 //。   3.3.13锁利触发平仓若实际盈亏>7按盈利平仓处理：初始单不挂反向，反向单下次开仓反转方向
 //。   5.3.14初始单止损平仓净亏≤配置阈值(默认-18)时不再立即反向翻仓（仅初始单）
-//。   5.3.15初始单止损后延迟1分钟再按价格条件决定是否反向翻仓：多单要求最新价<平仓价，空单要求最新价>平仓价
 //。   5.3.16新增启动立即下单开关：横盘时可勾选启动后立即开仓，之后由定时开仓接管
 //     5.3.17取消取反向调试
+//     5.3.18去除初始单止损后延迟1分钟按价格条件翻仓逻辑，恢复立即反向翻仓
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "5.3.17"
+#property version   "5.3.18"
 // 引入MQL5标准交易类库
 #include <Trade\Trade.mqh> 
 CTrade trade;
@@ -101,10 +101,6 @@ datetime g_pending_reverse_check_time = 0;
 double   g_reverse_tp_price = 0.0;
 double   g_reverse_sl_price = 0.0;
 bool     g_pending_immediate_open = false; // ★5.3.16：启动立即开仓待执行标志
-// ★★★ 5.3.15：初始单止损后延迟1分钟按价格条件再决定是否反向翻仓 ★★★
-datetime g_pending_sl_reverse_time = 0;   // >0 表示等待中，到期后检查价格条件
-double   g_sl_close_price = 0.0;          // 初始单止损平仓价
-bool     g_sl_was_buy = false;            // 初始单是否为多单（true=多，false=空）
 //===== 虚拟止损/止盈（本地记录）=====
 double   g_virtual_sl_price = 0.0;
 double   g_virtual_tp_price = 0.0;
@@ -269,10 +265,10 @@ int OnInit()
    if(g_pending_immediate_open)
       Print("【启动立即开仓】已启用：首次定时器将尝试立即开仓，之后由定时间隔接管");
    if(g_currentDirection == DIR_SHORT)
-      PrintFormat("EA启动 v5.3.17【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后延迟1分钟按价格条件翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理 + 重亏≤阈值跳过翻仓 + 启动立即开仓】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f | 启动立即开仓:%s",
+      PrintFormat("EA启动 v5.3.18【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 反转趋势过滤 + 锁利盈利>7按止盈处理 + 重亏≤阈值跳过翻仓 + 启动立即开仓】规则：高周期趋势做空 | 间隔:%d分钟 | 目标净值:%.2f | 启动立即开仓:%s",
                   IntervalMinutes, TargetNetProfit, (EnableImmediateOpenOnStart ? "开" : "关"));
    else
-      PrintFormat("EA启动 v5.3.17【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 止损后延迟1分钟按价格条件翻仓 + 反转趋势过滤 + 锁利盈利>7按止盈处理 + 重亏≤阈值跳过翻仓 + 启动立即开仓】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f | 启动立即开仓:%s",
+      PrintFormat("EA启动 v5.3.18【移动止损 + 逆势收紧移动止盈 + 锁定加仓(余额过滤) + 反转趋势过滤 + 锁利盈利>7按止盈处理 + 重亏≤阈值跳过翻仓 + 启动立即开仓】规则：高周期趋势做多 | 间隔:%d分钟 | 目标净值:%.2f | 启动立即开仓:%s",
                   IntervalMinutes, TargetNetProfit, (EnableImmediateOpenOnStart ? "开" : "关"));
    return INIT_SUCCEEDED;
 }
@@ -649,7 +645,7 @@ bool IsPositionClosedByTP(ulong position_id)
    return false;
 }
 //+------------------------------------------------------------------+
-//| 开反向翻仓单（初始单止损且延迟1分钟价格条件满足后调用）             |
+//| 开反向翻仓单（初始单止损后立即调用）                                 |
 //+------------------------------------------------------------------+
 void ExecuteReverseOrder()
 {
@@ -1484,17 +1480,14 @@ void CheckVirtualStopsAndClose()
                {
                   if(hitSL && !treatAsProfitableClose && !skipReverseOnHeavyLoss)
                   {
-                     // 真正止损（含锁利但盈利≤7，且未触发重亏过滤）→ 延迟1分钟后按价格条件再决定是否反向翻仓
-                     // 多单：最新价 < 平仓价 才反向；空单：最新价 > 平仓价 才反向
+                     // 真正止损（含锁利但盈利≤7，且未触发重亏过滤）→ 立即反向翻仓
                      ResetTrackTPState();
                      g_monitor_position_id = INVALID_POSITION_ID;
                      g_virtual_sl_price = 0.0;
                      g_virtual_tp_price = 0.0;
-                     g_sl_close_price = currentPrice;
-                     g_sl_was_buy = (posType == POSITION_TYPE_BUY);
-                     g_pending_sl_reverse_time = TimeTradeServer() + 60;
-                     PrintFormat("【初始单止损】已平仓，延迟1分钟后检查价格条件再决定是否反向翻仓 | 平仓价:%.5f | 原方向:%s",
-                                 g_sl_close_price, g_sl_was_buy ? "多" : "空");
+                     PrintFormat("【初始单止损】已平仓，立即执行反向翻仓 | 平仓价:%.5f | 原方向:%s",
+                                 currentPrice, (posType == POSITION_TYPE_BUY) ? "多" : "空");
+                     ExecuteReverseOrder();
                   }
                   else
                   {
@@ -1503,8 +1496,6 @@ void CheckVirtualStopsAndClose()
                      g_monitor_position_id = INVALID_POSITION_ID;
                      g_virtual_sl_price = 0.0;
                      g_virtual_tp_price = 0.0;
-                     g_pending_sl_reverse_time = 0;
-                     g_sl_close_price = 0.0;
                      if(treatAsProfitableClose)
                         Print("【初始单锁利盈利平仓】已平仓，不进行翻仓");
                      else if(skipReverseOnHeavyLoss)
@@ -1561,17 +1552,12 @@ void CheckVirtualStopsAndClose()
                {
                   PrintFormat("【兜底初始单重亏跳过翻仓】实际净盈亏 %.2f ≤ 阈值 %.2f，不再反向翻仓",
                               closedProfitFallback, SkipReverseLossThreshold);
-                  g_pending_sl_reverse_time = 0;
-                  g_sl_close_price = 0.0;
                }
                else
                {
-                  // ★ 5.3.15：兜底止损同样延迟1分钟后按价格条件决定是否反向
-                  g_sl_close_price = curPrice;
-                  g_sl_was_buy = (posType == POSITION_TYPE_BUY);
-                  g_pending_sl_reverse_time = TimeTradeServer() + 60;
-                  PrintFormat("【兜底初始单止损】已平仓，延迟1分钟后检查价格条件再决定是否反向翻仓 | 平仓价:%.5f | 原方向:%s",
-                              g_sl_close_price, g_sl_was_buy ? "多" : "空");
+                  PrintFormat("【兜底初始单止损】已平仓，立即执行反向翻仓 | 平仓价:%.5f | 原方向:%s",
+                              curPrice, (posType == POSITION_TYPE_BUY) ? "多" : "空");
+                  ExecuteReverseOrder();
                }
             }
             else
@@ -1592,72 +1578,11 @@ void ResetTrackTPState()
    g_trail_tp_triggered = false;
 }
 //+------------------------------------------------------------------+
-//| 5.3.15：初始单止损后延迟1分钟，按价格条件决定是否反向翻仓           |
-//| 多单：最新价 < 平仓价 才反向做空；空单：最新价 > 平仓价 才反向做多   |
-//+------------------------------------------------------------------+
-void ProcessPendingSLReverse()
-{
-   if(g_pending_sl_reverse_time <= 0)
-      return;
-   if(TimeTradeServer() < g_pending_sl_reverse_time)
-      return;
-
-   // 到期后只检查一次
-   datetime checkTime = g_pending_sl_reverse_time;
-   g_pending_sl_reverse_time = 0;
-
-   // 若期间已有持仓或挂单，则不再反向
-   if(CheckHasAnyPendingOrder() || CheckHasAnyPosition())
-   {
-      Print("【止损延迟翻仓】到期时已存在持仓或挂单，取消本次反向翻仓");
-      g_sl_close_price = 0.0;
-      return;
-   }
-
-   MqlTick tick;
-   if(!SymbolInfoTick(_Symbol, tick))
-   {
-      Print("【止损延迟翻仓】获取Tick失败，取消本次反向翻仓，错误码: ", GetLastError());
-      g_sl_close_price = 0.0;
-      return;
-   }
-
-   // 多单止损后用 bid 判断是否继续下跌；空单止损后用 ask 判断是否继续上涨
-   double latestPrice = g_sl_was_buy ? tick.bid : tick.ask;
-   bool conditionMet = false;
-   if(g_sl_was_buy)
-   {
-      // 初始多单止损：要求最新价 < 平仓价，才挂反向空单
-      conditionMet = (latestPrice < g_sl_close_price);
-      PrintFormat("【止损延迟翻仓-多→空】平仓价:%.5f 最新bid:%.5f 条件(最新价<平仓价):%s",
-                  g_sl_close_price, latestPrice, conditionMet ? "满足" : "不满足");
-   }
-   else
-   {
-      // 初始空单止损：要求最新价 > 平仓价，才挂反向多单
-      conditionMet = (latestPrice > g_sl_close_price);
-      PrintFormat("【止损延迟翻仓-空→多】平仓价:%.5f 最新ask:%.5f 条件(最新价>平仓价):%s",
-                  g_sl_close_price, latestPrice, conditionMet ? "满足" : "不满足");
-   }
-
-   if(conditionMet)
-   {
-      Print("【止损延迟翻仓】价格条件满足，执行反向翻仓");
-      ExecuteReverseOrder();
-   }
-   else
-   {
-      Print("【止损延迟翻仓】价格条件不满足，本次不挂反向翻仓单");
-   }
-   g_sl_close_price = 0.0;
-}
-//+------------------------------------------------------------------+
 //| 监控持仓状态                                                       |
 //+------------------------------------------------------------------+
 void MonitorPositionStatus()
 {
    CheckVirtualStopsAndClose();
-   ProcessPendingSLReverse();   // ★ 5.3.15：处理初始单止损后的延迟价格条件翻仓
    if(g_pending_cancel_time > 0)
    {
       if(TimeTradeServer() >= g_pending_cancel_time)
@@ -1868,8 +1793,6 @@ void ScanAndCloseProfitablePositions()
       g_virtual_tp_price = 0.0;
       g_reverse_sl_price = 0.0;
       g_reverse_tp_price = 0.0;
-      g_pending_sl_reverse_time = 0;
-      g_sl_close_price = 0.0;
       PrintFormat("【库存费避让】扫描完成：平仓 %d 个盈利仓位，撤销 %d 个挂单。亏损仓位已保留。",
                   closedCount, deletedCount);
    }
@@ -1927,10 +1850,6 @@ void OnTimer()
       else if(HasSkipOpenSignal())
       {
          Print("【启动立即开仓】检测到跳过开仓信号，跳过立即开仓");
-      }
-      else if(g_pending_sl_reverse_time > 0)
-      {
-         Print("【启动立即开仓】正在等待止损延迟翻仓，跳过立即开仓");
       }
       else
       {
@@ -2001,15 +1920,6 @@ void OnTimer()
    if(CheckHasAnyPendingOrder() || CheckHasAnyPosition())
    {
       PrintFormat("【定时任务】时间: %s，存在未成交委托或已成交仓位，跳过本次执行。下次触发: %s",
-                  TimeToString(serverNow, TIME_DATE|TIME_MINUTES),
-                  TimeToString(nextAfterThis, TIME_DATE|TIME_MINUTES));
-      g_nextTriggerTime = nextAfterThis;
-      return;
-   }
-   // ★ 5.3.15：等待止损延迟翻仓期间，禁止定时新开初始单，避免与反向单冲突
-   if(g_pending_sl_reverse_time > 0)
-   {
-      PrintFormat("【定时任务】时间: %s，正在等待止损延迟翻仓确认，跳过本次开仓。下次触发: %s",
                   TimeToString(serverNow, TIME_DATE|TIME_MINUTES),
                   TimeToString(nextAfterThis, TIME_DATE|TIME_MINUTES));
       g_nextTriggerTime = nextAfterThis;
